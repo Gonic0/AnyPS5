@@ -27,3 +27,4 @@ pr 7974    # feat(libkernel): map files through the guest's mmap on macOS hosts 
 # pr 7886  # test(agc): load the Vulkan loader with portability enumeration on macOS
 
 # Nuestras ramas
+branch fix/mugurc-backports   # backport de mugurc/macos-port: stat, shm, statfs, module info, rtld, dyld, agc thread priority
