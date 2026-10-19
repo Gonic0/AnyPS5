@@ -1,0 +1,29 @@
+# Parches que sync.sh aplica, en este orden, sobre upstream/main.
+#
+#   pr <N>         PR abierto de boykopovar/AnyPS5; se trae refs/pull/N/head en cada corrida.
+#   branch <rama>  rama nuestra (fix/*), creada desde upstream/main para poder abrir PR.
+#
+# Un PR ya mergeado en upstream se salta y sync.sh avisa para quitarlo de aquí.
+# Orden según la serie de mugurc anunciada en boykopovar/AnyPS5#1.
+
+# Fase 1: compilar libc y libkernel en macOS
+pr 4627    # fix(libc): build the host-facing libc code on macOS
+pr 7631    # feat(libkernel): direct memory mappings on macOS hosts
+pr 7804    # feat(libkernel): process, thread and clock queries on macOS hosts
+pr 7850    # feat(libkernel): UDP sockets and name resolution on macOS hosts
+pr 4630    # feat(libkernel): sceKernelRaiseException on macOS hosts
+pr 7559    # fix(libkernel): recognize listening sockets on macOS hosts
+pr 7937    # feat(libkernel): JIT shared memory on macOS hosts
+pr 7974    # feat(libkernel): map files through the guest's mmap on macOS hosts (depende de #7937)
+
+# Fase 2: runtime Mach-O y relinker (activar cuando la fase 1 compile)
+# pr 7741  # fix(relinker): initialize MXCSR in macOS guest entry
+# pr 7361  # fix(relinker): preserve executable exports in macOS output
+# pr 6448  # fix(relinker): convert stack-guard and thread-pointer reads with an empty PT_TLS for macOS
+# pr 7706  # fix(relinker): refuse branches into trapped guest GS instructions on macOS
+# pr 7695  # fix(libc): let the macOS write watch fault handler go first
+
+# Fase 3: MoltenVK
+# pr 7886  # test(agc): load the Vulkan loader with portability enumeration on macOS
+
+# Nuestras ramas
