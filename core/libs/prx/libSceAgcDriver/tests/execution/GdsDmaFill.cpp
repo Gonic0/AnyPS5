@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -208,12 +209,13 @@ int main() {
             Append(words, FillGds(0x0badf00du));
             Submit(std::move(words));
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (DrawPipeline::Queue0().Outstanding() < 2 && DrawPipeline::DrainRequestsByOpcode(0x50) == drainsBefore && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            const auto queued = DrawPipeline::Queue0().Outstanding();
+            const auto gds = AgcDriver::Pm4::GdsAddress() + GdsOffset;
+            while (!DrawPipeline::Queue0().Overlaps(gds, FillBytes) && DrawPipeline::DrainRequestsByOpcode(0x50) == drainsBefore && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const bool queued = DrawPipeline::Queue0().Overlaps(gds, FillBytes);
             const auto drains = DrawPipeline::DrainRequestsByOpcode(0x50);
             release.store(true, std::memory_order_release);
             check(drains == drainsBefore, "an immediate DMA_DATA fill of GDS drained the draw pipeline");
-            check(queued >= 2, "an immediate DMA_DATA fill of GDS was not queued behind the held draw pipeline item");
+            check(queued, "an immediate DMA_DATA fill of GDS was not queued behind the held draw pipeline item");
         }
         ExpectGds(readBack, 0x0badf00du, "a GDS to memory copy did not see the fill queued in the draw pipeline");
 
