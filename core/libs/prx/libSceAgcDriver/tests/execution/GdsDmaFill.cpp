@@ -80,8 +80,8 @@ std::array<std::uint32_t, 7> PatternFill(std::uint64_t destination, std::uint32_
     return {0xc0055000u, 2u << 29u, 0x1234abcdu, 0u, static_cast<std::uint32_t>(destination), static_cast<std::uint32_t>(destination >> 32u), bytes};
 }
 
-std::array<std::uint32_t, 7> CopyGdsTo(std::uint64_t destination) {
-    return {0xc0055000u, 1u << 29u, GdsOffset, 0u, static_cast<std::uint32_t>(destination), static_cast<std::uint32_t>(destination >> 32u), FillBytes};
+std::array<std::uint32_t, 7> CopyGdsTo(std::uint64_t destination, std::uint32_t offset = GdsOffset, std::uint32_t bytes = FillBytes) {
+    return {0xc0055000u, 1u << 29u, offset, 0u, static_cast<std::uint32_t>(destination), static_cast<std::uint32_t>(destination >> 32u), bytes};
 }
 
 template <std::size_t Count>
@@ -141,6 +141,7 @@ int main() {
         auto* code = GuestBlock();
         auto* output = GuestBlock();
         auto* source = GuestBlock();
+        auto* secondOutput = GuestBlock();
         std::memcpy(code, AppendProgram.data(), sizeof(AppendProgram));
 
         std::vector<std::uint32_t> words;
@@ -261,6 +262,31 @@ int main() {
             AgcDriverWaitIdle_nid_postfix();
             ExpectGds(readBack, 0x0c0ffee0u, "a memory to GDS copy behind a fill of GDS queued in the draw pipeline was overwritten by the fill");
             check(drains != drainsBefore, "a memory to GDS copy behind a fill of GDS queued in the draw pipeline did not drain it");
+        }
+
+        {
+            words.clear();
+            Append(words, FillGds(500u, CounterOffset, 16));
+            Submit(std::move(words));
+            AgcDriverWaitIdle_nid_postfix();
+            const auto drainsBefore = storesDrained.load();
+            words.clear();
+            AppendDispatch(words, code, output);
+            Append(words, FillGds(3000u, CounterOffset, 16));
+            AppendDispatch(words, code, secondOutput);
+            Append(words, CopyGdsTo(Address(readBack), CounterOffset, 16));
+            Submit(std::move(words));
+            AgcDriverWaitIdle_nid_postfix();
+            std::array<std::uint32_t, 1> first{};
+            std::array<std::uint32_t, 1> second{};
+            std::array<std::uint32_t, 4> counters{};
+            AgcDriver::GuestMemory::Read(Address(output), std::as_writable_bytes(std::span(first)), 4);
+            AgcDriver::GuestMemory::Read(Address(secondOutput), std::as_writable_bytes(std::span(second)), 4);
+            AgcDriver::GuestMemory::Read(Address(readBack), std::as_writable_bytes(std::span(counters)), 4);
+            check(first[0] == 500u, "the dispatch before the fill read " + std::to_string(first[0]) + ", not the earlier fill's 500");
+            check(second[0] == 3000u, "the dispatch after the fill, in the same submission, read " + std::to_string(second[0]) + ", not the fill's 3000");
+            check(counters[0] == 3032u && counters[1] == 2968u && counters[2] == 3032u, "the GDS counters after a dispatch, a fill and a dispatch are " + std::to_string(counters[0]) + ", " + std::to_string(counters[1]) + " and " + std::to_string(counters[2]) + ", not 3032, 2968 and 3032: the first dispatch's atomics landed after the fill");
+            check(storesDrained.load() == drainsBefore + 1, "a fill behind a dispatch still using the GDS did not drain the device as main does");
         }
 
         LibcRunShutdown_nid_postfix();

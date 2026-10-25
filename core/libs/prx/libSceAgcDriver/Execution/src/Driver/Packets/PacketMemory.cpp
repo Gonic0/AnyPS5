@@ -19,6 +19,17 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+bool gdsWritesPending(std::span<const std::uint32_t> packet) {
+    const auto address = Pm4::GdsAddress() + packet[4];
+    const auto bytes = static_cast<std::size_t>(Pm4::DmaBytes(packet));
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
+    return Graphics::Recorder::SnapshotWriteOverlaps(address, bytes) || Graphics::StorageTexture::AnyPendingOverlaps(range) || Graphics::AnyShadowedOverlaps(address, bytes);
+}
+
+}
+
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -138,8 +149,10 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             return true;
         };
         if (opcode == 0x50 && packet.size() >= 7 && Pm4::DmaDestination(packet) == Pm4::DmaSelectGds) {
-            orderedAlready = true;
-            drained = false;
+            if (!gdsWritesPending(packet)) {
+                orderedAlready = true;
+                drained = false;
+            }
         } else if (copyBehindPendingSource()) {
             ++copiesBehindPendingSources;
             wroteOnGpu = true;
@@ -300,6 +313,7 @@ void Driver::dumpSampleCounters(std::uint64_t address) {
 bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state) {
     if (opcode != 0x50 || queue != 0 || packet.size() < 7 || !DrawPipeline::Active() || !deferredLabels().labels.empty()) return false;
     const auto source = ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
+    if (Pm4::DmaDestination(packet) == Pm4::DmaSelectGds && gdsWritesPending(packet)) return false;
     constexpr std::size_t immediateLimit = std::size_t{16} << 20u;
     constexpr std::size_t gpuStoreLimit = 65536;
     if (source == 2 && Pm4::DmaBytes(packet) > gpuStoreLimit && Pm4::DmaDestination(packet) != Pm4::DmaSelectGds) {
