@@ -140,6 +140,7 @@ int main() {
         auto* held = GuestBlock();
         auto* code = GuestBlock();
         auto* output = GuestBlock();
+        auto* source = GuestBlock();
         std::memcpy(code, AppendProgram.data(), sizeof(AppendProgram));
 
         std::vector<std::uint32_t> words;
@@ -214,6 +215,53 @@ int main() {
             check(queued >= 2, "an immediate DMA_DATA fill of GDS was not queued behind the held draw pipeline item");
         }
         ExpectGds(readBack, 0x0badf00du, "a GDS to memory copy did not see the fill queued in the draw pipeline");
+
+        {
+            std::atomic<bool> release{false};
+            const auto address = Address(held);
+            DrawPipeline::Queue0().Enqueue([&release] {
+                while (!release.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }, {{address, address + 16}});
+            const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(0x50);
+            std::memset(readBack, 0, FillBytes);
+            words.clear();
+            Append(words, FillGds(0x600dcafeu));
+            Append(words, CopyGdsTo(Address(readBack)));
+            Submit(std::move(words));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (DrawPipeline::DrainRequestsByOpcode(0x50) == drainsBefore && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const auto drains = DrawPipeline::DrainRequestsByOpcode(0x50);
+            release.store(true, std::memory_order_release);
+            AgcDriverWaitIdle_nid_postfix();
+            std::array<std::uint32_t, FillBytes / 4> read{};
+            AgcDriver::GuestMemory::Read(Address(readBack), std::as_writable_bytes(std::span(read)), 4);
+            for (const auto word : read) check(word == 0x600dcafeu, "a GDS to memory copy behind a fill of GDS queued in the draw pipeline read the GDS before the fill");
+            check(drains != drainsBefore, "a GDS to memory copy behind a fill of GDS queued in the draw pipeline did not drain it");
+        }
+
+        {
+            std::array<std::uint32_t, FillBytes / 4> copied{};
+            copied.fill(0x0c0ffee0u);
+            std::memcpy(source, copied.data(), sizeof(copied));
+            std::atomic<bool> release{false};
+            const auto address = Address(held);
+            DrawPipeline::Queue0().Enqueue([&release] {
+                while (!release.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }, {{address, address + 16}});
+            const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(0x50);
+            const auto from = Address(source);
+            words.clear();
+            Append(words, FillGds(0xfeedf00du));
+            Append(words, std::array<std::uint32_t, 7>{0xc0055000u, 1u << 20u, static_cast<std::uint32_t>(from), static_cast<std::uint32_t>(from >> 32u), GdsOffset, 0u, FillBytes});
+            Submit(std::move(words));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (DrawPipeline::DrainRequestsByOpcode(0x50) == drainsBefore && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const auto drains = DrawPipeline::DrainRequestsByOpcode(0x50);
+            release.store(true, std::memory_order_release);
+            AgcDriverWaitIdle_nid_postfix();
+            ExpectGds(readBack, 0x0c0ffee0u, "a memory to GDS copy behind a fill of GDS queued in the draw pipeline was overwritten by the fill");
+            check(drains != drainsBefore, "a memory to GDS copy behind a fill of GDS queued in the draw pipeline did not drain it");
+        }
 
         LibcRunShutdown_nid_postfix();
         std::puts("GDS DMA fill tests passed");
