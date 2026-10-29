@@ -1593,25 +1593,20 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     if (setup.layout.clamp != NoImageComponent || descriptorClamp) {
         const auto& capabilities = state.supportedCapabilities;
         if (std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityMinLod)) == capabilities.end()) ctx.Fail(access.inst, "clamps its LOD, which needs the device's shaderResourceMinLod");
-        auto clamp = setup.layout.clamp != NoImageComponent ? AddressF32(ctx, access, setup.layout.clamp) : 0u;
-        if (descriptorClamp) {
-            const auto viewClamp = Unary(state, spv::OpBitcast, TypeF32(state), state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::MinLodBase + mem.resource, 0u));
-            if (clamp == 0u) {
-                clamp = viewClamp;
-            } else {
-                const auto combined = state.module.AllocateId();
-                state.module.AddFunction(spv::OpExtInst, TypeF32(state), combined, GlslStd450(state), GLSLstd450FMax, clamp, viewClamp);
-                clamp = combined;
-            }
-        }
+        const auto fmax = [&](std::uint32_t left, std::uint32_t right) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpExtInst, TypeF32(state), value, GlslStd450(state), GLSLstd450FMax, left, right);
+            return value;
+        };
+        const auto clamp = setup.layout.clamp != NoImageComponent ? AddressF32(ctx, access, setup.layout.clamp) : 0u;
+        const auto viewClamp = descriptorClamp ? Unary(state, spv::OpBitcast, TypeF32(state), state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::MinLodBase + mem.resource, 0u)) : 0u;
         if ((operandMask & spv::ImageOperandsLodMask) != 0u) {
-            const auto clamped = state.module.AllocateId();
-            state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FMax, operands.back(), clamp);
-            operands.back() = clamped;
+            if (clamp != 0u) operands.back() = fmax(operands.back(), clamp);
+            if (viewClamp != 0u) operands.back() = Select(state, TypeF32(state), Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), viewClamp, ZeroF32(state)), fmax(operands.back(), viewClamp), operands.back());
         } else {
             state.module.EmitCapability(spv::CapabilityMinLod);
             operandMask |= spv::ImageOperandsMinLodMask;
-            operands.push_back(clamp);
+            operands.push_back(clamp == 0u ? viewClamp : viewClamp == 0u ? clamp : fmax(clamp, viewClamp));
         }
     }
     const auto constantOffset = [&]() -> const IrValue* {

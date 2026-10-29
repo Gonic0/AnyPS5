@@ -181,18 +181,23 @@ const char* UnnormalizedUseReason(std::uint32_t uses) {
 
 void RequireShaderMinLod(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t image, const ImageResource& mode, std::uint32_t clamp) {
     const auto prefix = "image " + std::to_string(image) + " applies its T#'s minimum LOD of " + std::to_string(clamp) + "/256 in the shader";
-    if ((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u || mode.conversionFormat == IrBufferFormat::Format11_11_10UNorm) fail(prefix + ", which the emulated depth comparison and 11:11:10 conversion samples do not implement");
+    if ((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u || mode.conversionFormat == IrBufferFormat::Format11_11_10UNorm) fail(prefix + " to an emulated depth-compare or 11:11:10 sample, which is not implemented");
     for (const auto& pair : info.sampledPairs) {
         if (pair.image != image) continue;
         const auto& sampler = info.samplers.at(pair.sampler);
-        const auto name = " S# " + std::to_string(pair.sampler);
-        if (sampler.table != NoTable) fail(prefix + " but is sampled through" + name + ", which is selected at run time, so its LOD limits cannot be checked");
+        const auto name = "S# " + std::to_string(pair.sampler);
+        if (sampler.table != NoTable) fail(prefix + " and is sampled through " + name + " from a table, whose LOD range is unknown, which is not implemented");
+        if ((sampler.uses & SamplerUseQueryLod) != 0u) fail(prefix + " and " + name + " is used by image_get_lod, which is not implemented");
+        if ((sampler.uses & SamplerUseGather) != 0u && clamp >= 256u) fail(prefix + " and " + name + " is used by a gather, which reads below that level, which is not implemented");
+        if ((sampler.uses & (SamplerUseExplicitLod | SamplerUseImplicitLod | SamplerUseGradient)) == 0u) continue;
         const auto& words = snapshot.samplers.at(pair.sampler).dwords;
-        const bool mipmapped = (words[0] & ForceUnnormalizedBit) == 0u && ((words[2] >> 26u) & 3u) != 0u;
+        const bool unnormalized = (words[0] & ForceUnnormalizedBit) != 0u;
+        const bool mipmapped = !unnormalized && ((words[2] >> 26u) & 3u) != 0u;
         const auto maxLod = mipmapped ? (words[1] >> 12u) & 0xfffu : 0u;
-        if (maxLod < clamp) fail(prefix + " above the maximum LOD of " + std::to_string(maxLod) + "/256 of" + name + (mipmapped ? "" : ", which has no mip filter") + ", where Vulkan leaves the sampled level undefined");
+        if (maxLod < clamp) fail(prefix + " above the maximum LOD of " + std::to_string(maxLod) + "/256 of " + name + (mipmapped ? "" : unnormalized ? " (unnormalized)" : " (no mip filter)") + ", which is not implemented");
+        if ((((words[2] >> 20u) ^ (words[2] >> 22u)) & 1u) != 0u) fail(prefix + " and " + name + " has different magnification and minification filters, between which the clamp moves the choice, which is not implemented");
         const auto bias = static_cast<std::int32_t>(((words[2] & 0x3fffu) ^ 0x2000u) - 0x2000u);
-        if (bias != 0 && (sampler.uses & SamplerUseExplicitLod) != 0u) fail(prefix + " but" + name + " adds an LOD bias of " + std::to_string(bias) + "/256 to an explicit LOD after that clamp");
+        if (bias != 0 && (sampler.uses & SamplerUseExplicitLod) != 0u) fail(prefix + " to an explicit LOD that " + name + " biases by " + std::to_string(bias) + "/256, which is not implemented");
     }
 }
 
@@ -382,7 +387,8 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
             const auto& words = snapshot.images.at(index).dwords;
             const auto minLod = (words[1] >> 8u) & 0xfffu;
             const auto baseLevel = (words[3] >> 12u) & 0xfu;
-            const auto lastLevel = std::max((words[3] >> 16u) & 0xfu, baseLevel);
+            const auto maxMip = (words[5] >> 4u) & 0xfu;
+            const auto lastLevel = std::max(baseLevel <= maxMip ? std::min((words[3] >> 16u) & 0xfu, maxMip) : (words[3] >> 16u) & 0xfu, baseLevel);
             const auto clamp = minLod > baseLevel * 256u ? std::min(minLod - baseLevel * 256u, (lastLevel - baseLevel) * 256u) : 0u;
             if (clamp != 0u) RequireShaderMinLod(info, snapshot, index, modes.at(imageModes[index]), clamp);
             plan.specialization.push_back({PipelineSpecialization::MinLodBase + index, std::bit_cast<std::uint32_t>(static_cast<float>(clamp) / 256.0f)});

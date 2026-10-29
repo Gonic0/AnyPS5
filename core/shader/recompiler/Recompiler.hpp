@@ -749,7 +749,6 @@ struct CompiledShaderArtifact {
     bool bdaWrites = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
     std::uint64_t variantId = 0;
-    bool shaderImageMinLod = false;
 };
 
 struct ShaderInvocation {

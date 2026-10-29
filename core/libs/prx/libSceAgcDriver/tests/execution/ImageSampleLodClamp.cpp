@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <span>
 #include <string>
@@ -64,6 +65,7 @@ struct Case {
     std::uint32_t maxLod = 0xfffu;
     std::uint32_t mipFilter = 1u;
     std::int32_t bias = 0;
+    std::uint32_t filters = 0;
 };
 
 struct Sample {
@@ -72,11 +74,11 @@ struct Sample {
     std::uint32_t clamp;
     std::uint32_t x;
     std::uint32_t y;
-    std::uint32_t lod;
+    std::int32_t lod;
 };
 
 Sample SampleOf(std::uint32_t tid) {
-    return {tid % Levels, (tid / Levels) % Gradients, (tid / 3u) % Clamps, (tid * 7u + 3u) % Size, (tid * 5u + 1u) % Size, (tid / 4u) % Levels};
+    return {tid % Levels, (tid / Levels) % Gradients, (tid / 3u) % Clamps, (tid * 7u + 3u) % Size, (tid * 5u + 1u) % Size, static_cast<std::int32_t>((tid / 4u) % Levels) - 1};
 }
 
 std::uint32_t Bits(float value) {
@@ -136,7 +138,7 @@ std::array<std::uint32_t, 8> TextureDescriptor(const void* data, std::uint32_t m
 }
 
 std::array<std::uint32_t, 4> SamplerDescriptor(const Case& item) {
-    return {0u, item.maxLod << 12u, (static_cast<std::uint32_t>(item.bias) & 0x3fffu) | (item.mipFilter << 26u), 0u};
+    return {0u, item.maxLod << 12u, (static_cast<std::uint32_t>(item.bias) & 0x3fffu) | item.filters | (item.mipFilter << 26u), 0u};
 }
 
 ShaderRecompiler::RecompileRequest Request(std::span<const std::uint32_t> code, const ShaderRecompiler::SpirvTarget& target, const std::vector<std::uint32_t>& userData, std::span<const ShaderRecompiler::MemoryRegion> memory, bool cached) {
@@ -195,7 +197,12 @@ void Check(const Case& item, std::size_t results) {
         const auto gradient = static_cast<float>(sample.level) - 0.25f - static_cast<float>(item.baseLevel) + static_cast<float>(item.bias) / 256.0f;
         const auto floor = std::max(static_cast<float>(sample.clamp), view);
         const auto sampled = Level(gradient, floor, maxLod, last, item.baseLevel);
-        const std::array<std::uint32_t, 6> levels{sampled, Level(0.0f, floor, maxLod, last, item.baseLevel), sampled, sampled, Level(static_cast<float>(sample.lod), view, maxLod, last, item.baseLevel), Level(0.0f, view, maxLod, last, item.baseLevel)};
+        const auto explicitLevel = [&](float lod, float clamp) {
+            const auto clamped = view > 0.0f ? std::max({lod, clamp, view}) : std::max(lod, clamp);
+            return Level(clamped + static_cast<float>(item.bias) / 256.0f, 0.0f, maxLod, last, item.baseLevel);
+        };
+        const auto none = -std::numeric_limits<float>::infinity();
+        const std::array<std::uint32_t, 6> levels{sampled, explicitLevel(0.0f, static_cast<float>(sample.clamp)), sampled, sampled, explicitLevel(static_cast<float>(sample.lod), none), explicitLevel(0.0f, none)};
         for (std::size_t index = 0; index < results; ++index) {
             const std::uint32_t level = levels[index];
             const std::uint32_t size = Size >> level;
@@ -249,13 +256,11 @@ void CheckSpirvLanes(const ShaderRecompiler::SpirvTarget& deviceTarget) {
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     auto target = deviceTarget;
     target.shaderImageMinLod = false;
-    const auto& view = ShaderRecompiler::GetPreparedArtifact(*ShaderRecompiler::PrepareShader(Request(code, target, userData, memory, true)));
-    Require(MinLodSpecIds(view.spirv.Words()).empty(), "a target without the shader clamp declares minimum LOD specialization constants");
-    Require(!view.shaderImageMinLod, "a target without the shader clamp produced an artifact marked for it");
+    const auto view = ShaderRecompiler::PrepareShader(Request(code, target, userData, memory, true));
+    Require(MinLodSpecIds(ShaderRecompiler::GetPreparedArtifact(*view).spirv.Words()).empty(), "a target without the shader clamp declares minimum LOD specialization constants");
     target.shaderImageMinLod = true;
-    const auto& shader = ShaderRecompiler::GetPreparedArtifact(*ShaderRecompiler::PrepareShader(Request(code, target, userData, memory, true)));
-    Require(MinLodSpecIds(shader.spirv.Words()) == std::set<std::uint32_t>{ShaderRecompiler::PipelineSpecialization::MinLodBase}, "a target with the shader clamp does not declare exactly the image's minimum LOD specialization constant");
-    Require(shader.shaderImageMinLod, "a target with the shader clamp produced an artifact not marked for it");
+    const auto shader = ShaderRecompiler::PrepareShader(Request(code, target, userData, memory, true));
+    Require(MinLodSpecIds(ShaderRecompiler::GetPreparedArtifact(*shader).spirv.Words()) == std::set<std::uint32_t>{ShaderRecompiler::PipelineSpecialization::MinLodBase}, "a target with the shader clamp does not declare exactly the image's minimum LOD specialization constant");
 }
 
 }
@@ -275,15 +280,17 @@ int main(int argc, char** argv) {
         FillTexture();
         for (const auto& item : {Case{0u, 0u}, Case{0x200u, 0u}, Case{0x200u, 1u}, Case{0x200u, 0u, 0x300u}}) RunAndCheck(*device, Code, 6u, item, false);
         for (const auto& item : {Case{0x200u, 0u, 0xfffu, 1u, -256}, Case{0x100u, 1u, 0xfffu, 1u, -128}}) RunAndCheck(*device, GradientCode, 1u, item, false);
-        for (const auto& item : {Case{0x200u, 0u}, Case{0u, 0u}, Case{0x300u, 0u}, Case{0x200u, 1u}, Case{0u, 0u}}) RunAndCheck(*device, Code, 6u, item, true);
+        for (const auto& item : {Case{0u, 0u, 0xfffu, 1u, 256}, Case{0x100u, 1u, 0xfffu, 1u, -128}}) RunAndCheck(*device, Code, 6u, item, false);
+        for (const auto& item : {Case{0x200u, 0u}, Case{0u, 0u}, Case{0x300u, 0u}, Case{0x200u, 1u}, Case{0x100u, 0u}}) RunAndCheck(*device, Code, 6u, item, true);
         if (shaderClamp) {
             for (const auto& item : {Case{0x1c0u, 0u}, Case{0x2c0u, 1u}}) RunAndCheck(*device, Code, 6u, item, false);
             RunAndCheck(*device, GradientCode, 1u, Case{0x1c0u, 0u, 0xfffu, 1u, 128}, false);
             for (const auto& item : {Case{0x1c0u, 0u}, Case{0u, 0u}, Case{0x2c0u, 1u}}) RunAndCheck(*device, Code, 6u, item, true);
-            RequireRejected(*device, Case{0x200u, 0u, 0x100u}, "above the maximum LOD of 256/256 of S# ");
-            RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 0u}, "above the maximum LOD of 0/256 of S# 0, which has no mip filter");
-            RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, -256}, "adds an LOD bias of -256/256 to an explicit LOD");
-            RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, 64}, "adds an LOD bias of 64/256 to an explicit LOD");
+            RequireRejected(*device, Case{0x200u, 0u, 0x100u}, "above the maximum LOD of 256/256 of S# 0, which is not implemented");
+            RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 0u}, "above the maximum LOD of 0/256 of S# 0 (no mip filter), which is not implemented");
+            RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, -256}, "to an explicit LOD that S# 0 biases by -256/256, which is not implemented");
+            RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, 64}, "to an explicit LOD that S# 0 biases by 64/256, which is not implemented");
+            RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, 0, 1u << 20u}, "and S# 0 has different magnification and minification filters");
         }
         std::puts(shaderClamp ? "image sample LOD clamp tests passed in the shader-clamp lane" : "image sample LOD clamp tests passed in the image-view lane");
         return 0;
