@@ -8952,6 +8952,33 @@ void verifyGuardedNullPointers() {
     }
     root[4] = 1u;
 
+    auto belowCode = branchCode;
+    belowCode[12] = 0xfa1ffffcu;
+    belowCode.push_back(0xbf810000u);
+    NestedRequest below(belowCode, root.data());
+    point(payloadAddress + 4u);
+    AgcDriver::ShaderMemory belowMemory({});
+    const auto belowValid = belowMemory.Capture(below.request);
+    require(belowValid->snapshot.srtPoison.empty() && belowValid->snapshot.flattenedSrt.at(belowValid->plan->guardedSrtSlots.at(0)) == payload, "guarded pointer: a read below a mapped nested pointer does not hold its word");
+    for (const auto condition : {1u, 0u}) {
+        point(0u);
+        root[4] = condition;
+        below.request.context.memory = {};
+        AgcDriver::ShaderMemory memory({});
+        const auto capture = memory.Capture(below.request);
+        const auto& poison = capture->snapshot.srtPoison;
+        require(poison.size() == condition, "guarded pointer: a read below a null nested pointer was poisoned on a path that skips it, or not poisoned on one that takes it");
+        if (condition != 0u) {
+            require(poison[0].pc == 0x2cu && poison[0].address == 0xfffffffffffcu && slotPc(*capture->plan, poison[0].slot) == 0x2cu, "guarded pointer: a read below a null nested pointer was not poisoned at its pc and wrapped address");
+            require(GuardRecords(*capture), "guarded pointer: the poison record of a read below a null pointer is not where the guard reads it");
+        }
+        const auto regions = memory.Regions();
+        below.request.context.memory = regions;
+        const auto result = Recompile(below.request, *capture);
+        require(result->poisonedSrtReads == condition && faultBinding(*result), "guarded pointer: a read below a null pointer does not report through the fault buffer");
+    }
+    root[4] = 1u;
+
     NestedRequest chain(chainCode, root.data());
     point(unmapped);
     AgcDriver::ShaderMemory chainMemory({});
