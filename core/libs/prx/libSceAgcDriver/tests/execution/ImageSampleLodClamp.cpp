@@ -179,6 +179,7 @@ std::uint32_t Wrap(std::uint32_t coordinate, std::int32_t offset, std::uint32_t 
 
 std::uint32_t Level(float lambda, float floor, float maxLod, std::uint32_t last, std::uint32_t baseLevel) {
     const auto lod = std::min(std::max({lambda, floor, 0.0f}), maxLod);
+    Require(std::abs(lod - std::floor(lod) - 0.5f) > 1.0f / 512.0f, "image sample LOD clamp: an expected LOD of " + std::to_string(lod) + " sits on a nearest-mip rounding tie, which Vulkan leaves to the implementation");
     return std::min(static_cast<std::uint32_t>(std::ceil(lod + 0.5f)) - 1u, last) + baseLevel;
 }
 
@@ -202,9 +203,16 @@ void Check(const Case& item, std::size_t results) {
             return Level(clamped + static_cast<float>(item.bias) / 256.0f, 0.0f, maxLod, last, item.baseLevel);
         };
         const auto none = -std::numeric_limits<float>::infinity();
-        const std::array<std::uint32_t, 6> levels{sampled, explicitLevel(0.0f, static_cast<float>(sample.clamp)), sampled, sampled, explicitLevel(static_cast<float>(sample.lod), none), explicitLevel(0.0f, none)};
+        const auto levelOf = [&](std::size_t index) {
+            switch (index) {
+                case 1: return explicitLevel(0.0f, static_cast<float>(sample.clamp));
+                case 4: return explicitLevel(static_cast<float>(sample.lod), none);
+                case 5: return explicitLevel(0.0f, none);
+                default: return sampled;
+            }
+        };
         for (std::size_t index = 0; index < results; ++index) {
-            const std::uint32_t level = levels[index];
+            const std::uint32_t level = levelOf(index);
             const std::uint32_t size = Size >> level;
             const std::array<std::uint32_t, 4> expected{level, Wrap(sample.x >> level, offsets[index][0], size), Wrap(sample.y >> level, offsets[index][1], size), 255u};
             for (std::uint32_t component = 0; component < 4u; ++component) {
@@ -280,7 +288,7 @@ int main(int argc, char** argv) {
         FillTexture();
         for (const auto& item : {Case{0u, 0u}, Case{0x200u, 0u}, Case{0x200u, 1u}, Case{0x200u, 0u, 0x300u}}) RunAndCheck(*device, Code, 6u, item, false);
         for (const auto& item : {Case{0x200u, 0u, 0xfffu, 1u, -256}, Case{0x100u, 1u, 0xfffu, 1u, -128}}) RunAndCheck(*device, GradientCode, 1u, item, false);
-        for (const auto& item : {Case{0u, 0u, 0xfffu, 1u, 256}, Case{0x100u, 1u, 0xfffu, 1u, -128}}) RunAndCheck(*device, Code, 6u, item, false);
+        for (const auto& item : {Case{0u, 0u, 0xfffu, 1u, 256}, Case{0x100u, 1u, 0xfffu, 1u, -96}}) RunAndCheck(*device, Code, 6u, item, false);
         for (const auto& item : {Case{0x200u, 0u}, Case{0u, 0u}, Case{0x300u, 0u}, Case{0x200u, 1u}, Case{0x100u, 0u}}) RunAndCheck(*device, Code, 6u, item, true);
         if (shaderClamp) {
             for (const auto& item : {Case{0x1c0u, 0u}, Case{0x2c0u, 1u}}) RunAndCheck(*device, Code, 6u, item, false);
