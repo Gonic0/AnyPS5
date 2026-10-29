@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -94,13 +95,13 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
-std::array<std::uint32_t, 8> TextureDescriptor(const void* data) {
+std::array<std::uint32_t, 8> TextureDescriptor(const void* data, std::uint32_t minLod, std::uint32_t baseLevel) {
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
     return {
         static_cast<std::uint32_t>(address >> 8u),
-        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (((Size - 1u) & 3u) << 30u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (minLod << 8u) | (Format8888UNorm << 20u) | (((Size - 1u) & 3u) << 30u),
         ((Size - 1u) >> 2u) | ((Size - 1u) << 14u),
-        0xfacu | ((Levels - 1u) << 16u) | (Type2D << 28u),
+        0xfacu | (baseLevel << 12u) | ((Levels - 1u) << 16u) | (Type2D << 28u),
         0u,
         (Levels - 1u) << 4u,
         0u,
@@ -112,10 +113,10 @@ std::array<std::uint32_t, 4> SamplerDescriptor() {
     return {0u, 0xfffu << 12u, 1u << 26u, 0u};
 }
 
-void Run(AgcDriver::VulkanDevice& device) {
+void Run(AgcDriver::VulkanDevice& device, std::uint32_t minLod, std::uint32_t baseLevel) {
     std::vector<std::uint32_t> userData(16, 0u);
     const auto buffer = BufferDescriptor(Buffer.data(), static_cast<std::uint32_t>(Buffer.size() * 4u));
-    const auto texture = TextureDescriptor(Texels.data());
+    const auto texture = TextureDescriptor(Texels.data(), minLod, baseLevel);
     const auto sampler = SamplerDescriptor();
     std::copy(buffer.begin(), buffer.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
@@ -140,20 +141,22 @@ std::uint32_t Wrap(std::uint32_t coordinate, std::int32_t offset, std::uint32_t 
     return static_cast<std::uint32_t>(((static_cast<std::int32_t>(coordinate) + offset) % extent + extent) % extent);
 }
 
-void Check() {
+void Check(std::uint32_t minLod, std::uint32_t baseLevel) {
     constexpr std::array<const char*, 4> names{"image_sample_d_cl", "image_sample_cl", "image_sample_d_cl_o (1, 2)", "image_sample_d_cl_o (-1, -2)"};
     constexpr std::array<std::array<std::int32_t, 2>, 4> offsets{{{0, 0}, {0, 0}, {1, 2}, {-1, -2}}};
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
         const auto sample = SampleOf(tid);
-        const std::uint32_t clamped = std::max(sample.level, sample.clamp);
-        const std::array<std::uint32_t, 4> levels{clamped, sample.clamp, clamped, clamped};
+        const std::uint32_t last = Levels - 1u - baseLevel;
+        const std::uint32_t floor = std::max(sample.clamp, std::max(minLod >> 8u, baseLevel) - baseLevel);
+        const std::uint32_t clamped = std::min(std::max(std::max(sample.level, baseLevel) - baseLevel, floor), last) + baseLevel;
+        const std::array<std::uint32_t, 4> levels{clamped, std::min(floor, last) + baseLevel, clamped, clamped};
         for (std::uint32_t index = 0; index < levels.size(); ++index) {
             const std::uint32_t level = levels[index];
             const std::uint32_t size = Size >> level;
             const std::array<std::uint32_t, 4> expected{level, Wrap(sample.x >> level, offsets[index][0], size), Wrap(sample.y >> level, offsets[index][1], size), 255u};
             for (std::uint32_t component = 0; component < 4u; ++component) {
                 const float value = std::bit_cast<float>(Buffer[tid * Words + ResultWord + index * 4u + component]) * 255.0f;
-                Require(std::lround(value) == static_cast<long>(expected[component]), std::string(names[index]) + ": thread " + std::to_string(tid) + " component " + std::to_string(component) + " is " + std::to_string(value) + ", expected " + std::to_string(expected[component]));
+                Require(std::lround(value) == static_cast<long>(expected[component]), std::string(names[index]) + " with T# MIN_LOD " + std::to_string(minLod) + " over BASE_LEVEL " + std::to_string(baseLevel) + ": thread " + std::to_string(tid) + " component " + std::to_string(component) + " is " + std::to_string(value) + ", expected " + std::to_string(expected[component]));
             }
         }
     }
@@ -169,10 +172,12 @@ int main() {
             std::puts("skipped, the device has no shaderResourceMinLod");
             return VulkanTestSkipped;
         }
-        FillInput();
         FillTexture();
-        Run(*device);
-        Check();
+        for (const auto& [minLod, baseLevel] : {std::pair{0u, 0u}, std::pair{0x200u, 0u}, std::pair{0x200u, 1u}}) {
+            FillInput();
+            Run(*device, minLod, baseLevel);
+            Check(minLod, baseLevel);
+        }
         std::puts("image sample LOD clamp tests passed");
         return 0;
     } catch (const std::exception& error) {
