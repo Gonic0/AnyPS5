@@ -19,6 +19,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "IntermediateRepresentation/include/IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include <algorithm>
@@ -43,6 +44,9 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#if defined(__APPLE__)
+#include <unistd.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -4220,6 +4224,24 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 
 namespace {
 
+#if defined(__APPLE__)
+std::atomic<bool> labelTrapsSet{false};
+
+void ResolveLabelTrap(std::uintptr_t begin, std::uintptr_t end) {
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    GuestMemory::FlushGpuWrites(begin, bytes);
+    while (AgcDriver::DriverDetail::DrawPipeline::HeldReads(begin, bytes)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        GuestMemory::FlushGpuWrites(begin, bytes);
+    }
+}
+
+bool LabelTrapsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_LABEL_READ_TRAP") == nullptr && GuestWriteWatch::GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveLabelTrap);
+    return enabled;
+}
+#endif
+
 void waitForIdlePublish(const char* reason) {
     if (reason == nullptr || std::strcmp(reason, "idle") != 0 || Recorder::InCompletion()) return;
     if (auto* recorder = Recorder::Active()) {
@@ -4283,6 +4305,9 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     if (PublishReasonFor(reason) == PublishReason::Hook && texture->hookSkipSite.load(std::memory_order_relaxed) == static_cast<std::uint8_t>(GuestMemory::CurrentReadSite())) flushedAfterSkipSameSite.fetch_add(1, std::memory_order_relaxed);
                 }
                 if (auto alive = texture->weak_from_this().lock()) flush.push_back(std::move(alive));
+#if defined(__APPLE__)
+                if (labelTrapsSet.load(std::memory_order_relaxed)) GuestWriteWatch::GuestWriteWatchReleaseReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes));
+#endif
                 it = pending.textures.erase(it);
             } else {
                 ++it;
@@ -4670,8 +4695,24 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
+#if defined(__APPLE__)
+        const bool trap = LabelTrapsEnabled();
+        if (trap) labelTrapsSet.store(true, std::memory_order_relaxed);
+        static const auto page = static_cast<std::uint64_t>(::getpagesize());
+        const auto trapped = [&](const StorageTexture* texture) {
+            const auto first = texture->descriptor.baseAddress & ~(page - 1);
+            const auto bytes = static_cast<std::size_t>(((texture->descriptor.baseAddress + texture->guestBytes + page - 1) & ~(page - 1)) - first);
+            const auto shares = [&](const StorageTexture* other) { return other != texture && other->overlaps(first, bytes); };
+            if (std::any_of(pending.textures.begin(), pending.textures.end(), shares) || std::any_of(pending.flushing.begin(), pending.flushing.end(), shares)) return false;
+            return GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes));
+        };
+#endif
         for (const auto* texture : pending.textures) {
-            if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
+            if (texture->descriptor.tileMode != TextureTileMode::kLinear && texture->guestBytes > SmallStoreBytes) continue;
+#if defined(__APPLE__)
+            if (trap && trapped(texture)) continue;
+#endif
+            ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
     }
     for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
