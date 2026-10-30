@@ -537,6 +537,7 @@ private:
     static constexpr std::uint8_t Fresh = 0x40;
     static constexpr std::uint8_t ReadTrapped = 0x80;
     static constexpr std::size_t ResolveSlots = 32;
+    static constexpr std::size_t RetrySlots = 64;
     static constexpr unsigned UntrappedRetries = 16;
 
     enum SlotState : unsigned { Free, Claimed, Queued, Running, Done };
@@ -556,7 +557,9 @@ private:
 
     struct Retry {
         std::uintptr_t page = 0;
+        pthread_t thread = nullptr;
         std::uint64_t generation = 0;
+        std::uint64_t used = 0;
         unsigned count = 0;
     };
 
@@ -777,9 +780,11 @@ private:
 
     bool retryUntrapped(std::uintptr_t page, std::uint8_t state, bool write) {
         if ((untrappedProtection(state) & (write ? PROT_WRITE : PROT_READ)) == 0) return false;
-        auto found = std::find_if(_retries.begin(), _retries.end(), [&](const Retry& retry) { return retry.page == page; });
-        if (found == _retries.end()) found = _retries.begin() + static_cast<std::ptrdiff_t>(_retryNext++ % _retries.size());
-        if (found->page != page || found->generation != _untrapGeneration) *found = {page, _untrapGeneration, 0};
+        const auto thread = pthread_self();
+        auto found = std::find_if(_retries.begin(), _retries.end(), [&](const Retry& retry) { return retry.used != 0 && retry.page == page && pthread_equal(retry.thread, thread); });
+        if (found == _retries.end()) found = std::min_element(_retries.begin(), _retries.end(), [](const Retry& left, const Retry& right) { return left.used < right.used; });
+        if (found->used == 0 || found->page != page || !pthread_equal(found->thread, thread) || found->generation != _untrapGeneration) *found = {page, thread, _untrapGeneration, 0, 0};
+        found->used = ++_retryUses;
         return ++found->count <= UntrappedRetries;
     }
 
@@ -940,8 +945,8 @@ private:
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _hostWrites;
     std::multimap<std::uintptr_t, std::uintptr_t> _traps;
     std::vector<Resolving> _resolving;
-    std::array<Retry, 16> _retries{};
-    std::size_t _retryNext = 0;
+    std::array<Retry, RetrySlots> _retries{};
+    std::uint64_t _retryUses = 0;
     std::uint64_t _untrapGeneration = 0;
     std::atomic<bool> _trapping{false};
     std::atomic<void (*)(std::uintptr_t, std::uintptr_t)> _resolver{nullptr};

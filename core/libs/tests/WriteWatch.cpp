@@ -19,6 +19,7 @@
 
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/ndr.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -552,6 +553,83 @@ void CheckReadTrapThreads() {
     ::alarm(0);
 }
 
+void CheckReadTrapLateFaults() {
+    const pid_t child = ::fork();
+    Require(child >= 0, "cannot fork a child for late read faults");
+    if (child == 0) {
+        ::alarm(10);
+        try {
+            constexpr std::size_t Readers = 32;
+            Region region(1);
+            GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+            static_cast<void>(region.Collect());
+            Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+            Traps().fill = 0x6b;
+            Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(0), region.page), "cannot set a read trap");
+            mach_port_t port = MACH_PORT_NULL;
+            Require(mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port) == KERN_SUCCESS && mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS, "cannot create the exception port");
+            std::atomic<std::size_t> ready{0};
+            std::atomic<bool> start{false};
+            std::atomic<std::size_t> wrong{0};
+            std::array<std::thread, Readers> readers;
+            for (auto& reader : readers) {
+                reader = std::thread([&] {
+                    if (thread_set_exception_ports(mach_thread_self(), EXC_MASK_BAD_ACCESS, port, EXCEPTION_DEFAULT, THREAD_STATE_NONE) != KERN_SUCCESS) wrong.fetch_add(1);
+                    ready.fetch_add(1);
+                    while (!start.load()) std::this_thread::yield();
+                    if (*reinterpret_cast<const volatile std::uint8_t*>(region.base) != 0x6b) wrong.fetch_add(1);
+                });
+            }
+            while (ready.load() != Readers) std::this_thread::yield();
+            start.store(true);
+            struct Request {
+                mach_msg_header_t header;
+                mach_msg_body_t body;
+                mach_msg_port_descriptor_t thread;
+                mach_msg_port_descriptor_t task;
+                NDR_record_t ndr;
+                exception_type_t exception;
+                mach_msg_type_number_t codes;
+                integer_t code[2];
+                mach_msg_trailer_t trailer;
+            };
+            std::vector<Request> held(Readers);
+            for (auto& request : held) {
+                Require(mach_msg(&request.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(Request), port, 5000, MACH_PORT_NULL) == MACH_MSG_SUCCESS, "a reader of a trapped page did not fault");
+                Require(request.exception == EXC_BAD_ACCESS, "a reader of a trapped page raised another exception");
+                mach_port_deallocate(mach_task_self(), request.thread.name);
+                mach_port_deallocate(mach_task_self(), request.task.name);
+            }
+            Require(*reinterpret_cast<const volatile std::uint8_t*>(region.base) == 0x6b, "a read of a trapped page does not see the resolver's bytes");
+            Require(PageProtection(region.base) & PROT_READ, "a resolved trap does not give back read access");
+            for (const auto& request : held) {
+                struct {
+                    mach_msg_header_t header;
+                    NDR_record_t ndr;
+                    kern_return_t result;
+                } reply{};
+                reply.header.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(request.header.msgh_bits), 0);
+                reply.header.msgh_remote_port = request.header.msgh_remote_port;
+                reply.header.msgh_size = sizeof(reply);
+                reply.header.msgh_id = request.header.msgh_id + 100;
+                reply.ndr = NDR_record;
+                reply.result = KERN_FAILURE;
+                Require(mach_msg(&reply.header, MACH_SEND_MSG, sizeof(reply), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) == MACH_MSG_SUCCESS, "cannot pass a held fault on as a signal");
+            }
+            for (auto& reader : readers) reader.join();
+            Require(wrong.load() == 0, "a reader whose fault arrived after its page was given back does not see the resolver's bytes");
+            Require(TakeTrapCalls().size() == 1, "late read faults resolve the trap again");
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "%s\n", error.what());
+            ::_exit(1);
+        }
+        ::_exit(0);
+    }
+    int status = 0;
+    Require(::waitpid(child, &status, 0) == child, "cannot wait for the late read fault child");
+    Require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "32 read faults that arrive after their page was given back are not all retried");
+}
+
 void CheckRaisedSignals() {
     Require(GuestWriteWatchAvailable_nid_postfix(), "write watch is unavailable");
     for (const int signal : {SIGBUS, SIGSEGV}) {
@@ -571,7 +649,7 @@ void CheckRaisedSignals() {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads, raised, read-trap, read-trap-threads or read-trap-fault");
+        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads, raised, read-trap, read-trap-threads, read-trap-fault or read-trap-late");
         const std::string_view mode(argv[1]);
         if (mode == "collect") CheckCollect();
         else if (mode == "fresh") CheckFresh();
@@ -589,6 +667,7 @@ int main(int argc, char** argv) {
         else if (mode == "read-trap") CheckReadTrap();
         else if (mode == "read-trap-threads") CheckReadTrapThreads();
         else if (mode == "read-trap-fault") CheckReadTrapFaults();
+        else if (mode == "read-trap-late") CheckReadTrapLateFaults();
         else throw std::runtime_error("unknown write watch test");
         std::printf("write watch %s passed\n", argv[1]);
         return 0;
