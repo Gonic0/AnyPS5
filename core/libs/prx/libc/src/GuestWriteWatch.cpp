@@ -541,6 +541,7 @@ private:
     static constexpr std::size_t ResolveSlots = 32;
     static constexpr std::size_t RetrySlots = 64;
     static constexpr unsigned UntrappedRetries = 16;
+    static constexpr unsigned GenerationRetries = RetrySlots * UntrappedRetries;
 
     enum SlotState : unsigned { Free, Claimed, Queued, Running, Done };
     enum class Owner { Any, Self, Others };
@@ -782,6 +783,11 @@ private:
 
     bool retryUntrapped(std::uintptr_t page, std::uint8_t state, bool write) {
         if ((untrappedProtection(state) & (write ? PROT_WRITE : PROT_READ)) == 0) return false;
+        if (_retryGeneration != _untrapGeneration) {
+            _retryGeneration = _untrapGeneration;
+            _generationRetries = 0;
+        }
+        if (++_generationRetries > GenerationRetries) return false;
         const auto thread = pthread_self();
         auto found = std::find_if(_retries.begin(), _retries.end(), [&](const Retry& retry) { return retry.used != 0 && retry.page == page && pthread_equal(retry.thread, thread); });
         if (found == _retries.end()) found = std::min_element(_retries.begin(), _retries.end(), [](const Retry& left, const Retry& right) { return left.used < right.used; });
@@ -949,6 +955,8 @@ private:
     std::vector<Resolving> _resolving;
     std::array<Retry, RetrySlots> _retries{};
     std::uint64_t _retryUses = 0;
+    std::uint64_t _retryGeneration = 0;
+    unsigned _generationRetries = 0;
     std::uint64_t _untrapGeneration = 0;
     std::atomic<bool> _trapping{false};
     std::atomic<void (*)(std::uintptr_t, std::uintptr_t)> _resolver{nullptr};

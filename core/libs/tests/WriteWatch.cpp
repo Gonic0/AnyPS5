@@ -630,6 +630,93 @@ void CheckReadTrapLateFaults() {
     Require(WIFEXITED(status) && WEXITSTATUS(status) == 0, "32 read faults that arrive after their page was given back are not all retried");
 }
 
+void CheckReadTrapFaultBound() {
+    const pid_t child = ::fork();
+    Require(child >= 0, "cannot fork a child for persistent read faults");
+    if (child == 0) {
+        ::alarm(20);
+        try {
+            constexpr std::size_t Readers = 66;
+            constexpr std::size_t Rounds = 40;
+            const auto bytes = static_cast<std::size_t>(::getpagesize());
+            Region trapped(1);
+            GuestWriteWatchRegister_nid_postfix(trapped.base, trapped.bytes);
+            Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap) && GuestWriteWatchTrapReads_nid_postfix(trapped.Address(0), trapped.page), "cannot set a read trap");
+            char path[] = "/tmp/anyps5-write-watch-XXXXXX";
+            const int file = ::mkstemp(path);
+            Require(file >= 0, "cannot create the backing file");
+            ::unlink(path);
+            Require(::ftruncate(file, static_cast<off_t>(bytes)) == 0, "cannot size the backing file");
+            auto* mapped = static_cast<std::uint8_t*>(::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0));
+            Require(mapped != MAP_FAILED && ::ftruncate(file, 0) == 0, "cannot truncate a watched file mapping");
+            ::close(file);
+            GuestWriteWatchRegister_nid_postfix(mapped, bytes);
+            mach_port_t port = MACH_PORT_NULL;
+            Require(mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port) == KERN_SUCCESS && mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS, "cannot create the exception port");
+            std::atomic<std::size_t> ready{0};
+            std::atomic<bool> start{false};
+            std::vector<std::thread> readers;
+            for (std::size_t index = 0; index < Readers; ++index) {
+                readers.emplace_back([&] {
+                    Require(thread_set_exception_ports(mach_thread_self(), EXC_MASK_BAD_ACCESS, port, EXCEPTION_DEFAULT, THREAD_STATE_NONE) == KERN_SUCCESS, "cannot set a thread exception port");
+                    ready.fetch_add(1);
+                    while (!start.load()) std::this_thread::yield();
+                    static_cast<void>(*reinterpret_cast<const volatile std::uint8_t*>(mapped));
+                });
+            }
+            while (ready.load() != Readers) std::this_thread::yield();
+            struct Request {
+                mach_msg_header_t header;
+                mach_msg_body_t body;
+                mach_msg_port_descriptor_t thread;
+                mach_msg_port_descriptor_t task;
+                NDR_record_t ndr;
+                exception_type_t exception;
+                mach_msg_type_number_t codes;
+                integer_t code[2];
+                mach_msg_trailer_t trailer;
+            };
+            const auto receive = [&](Request& request) {
+                Require(mach_msg(&request.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(Request), port, 5000, MACH_PORT_NULL) == MACH_MSG_SUCCESS, "a reader of a truncated mapping did not fault");
+                mach_port_deallocate(mach_task_self(), request.task.name);
+            };
+            const auto pass = [](const Request& request) {
+                struct {
+                    mach_msg_header_t header;
+                    NDR_record_t ndr;
+                    kern_return_t result;
+                } reply{};
+                reply.header.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(request.header.msgh_bits), 0);
+                reply.header.msgh_remote_port = request.header.msgh_remote_port;
+                reply.header.msgh_size = sizeof(reply);
+                reply.header.msgh_id = request.header.msgh_id + 100;
+                reply.ndr = NDR_record;
+                reply.result = KERN_FAILURE;
+                Require(mach_msg(&reply.header, MACH_SEND_MSG, sizeof(reply), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) == MACH_MSG_SUCCESS, "cannot pass a held fault on as a signal");
+            };
+            start.store(true);
+            std::vector<Request> held(Readers);
+            for (auto& request : held) receive(request);
+            for (std::size_t round = 0; round < Rounds; ++round) {
+                for (auto& request : held) {
+                    const auto thread = request.thread.name;
+                    pass(request);
+                    receive(request);
+                    Require(request.thread.name == thread, "a held reader faulted out of turn");
+                    mach_port_deallocate(mach_task_self(), thread);
+                }
+            }
+            ::_exit(3);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "%s\n", error.what());
+            ::_exit(1);
+        }
+    }
+    int status = 0;
+    Require(::waitpid(child, &status, 0) == child, "cannot wait for the persistent read fault child");
+    Require(WIFSIGNALED(status) && (WTERMSIG(status) == SIGBUS || WTERMSIG(status) == SIGSEGV), "66 threads that keep faulting on a truncated mapping in turn are retried without bound");
+}
+
 void CheckRaisedSignals() {
     Require(GuestWriteWatchAvailable_nid_postfix(), "write watch is unavailable");
     for (const int signal : {SIGBUS, SIGSEGV}) {
@@ -649,7 +736,7 @@ void CheckRaisedSignals() {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads, raised, read-trap, read-trap-threads, read-trap-fault or read-trap-late");
+        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads, raised, read-trap, read-trap-threads, read-trap-fault, read-trap-late or read-trap-fault-bound");
         const std::string_view mode(argv[1]);
         if (mode == "collect") CheckCollect();
         else if (mode == "fresh") CheckFresh();
@@ -668,6 +755,7 @@ int main(int argc, char** argv) {
         else if (mode == "read-trap-threads") CheckReadTrapThreads();
         else if (mode == "read-trap-fault") CheckReadTrapFaults();
         else if (mode == "read-trap-late") CheckReadTrapLateFaults();
+        else if (mode == "read-trap-fault-bound") CheckReadTrapFaultBound();
         else throw std::runtime_error("unknown write watch test");
         std::printf("write watch %s passed\n", argv[1]);
         return 0;
