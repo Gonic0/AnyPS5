@@ -202,7 +202,7 @@ void RequireShaderMinLod(const ShaderInfo& info, const ResourceSnapshot& snapsho
         const bool mipmapped = !unnormalized && ((words[2] >> 26u) & 3u) != 0u;
         const auto maxLod = mipmapped ? (words[1] >> 12u) & 0xfffu : 0u;
         if (!unnormalized && maxLod == 0u) {
-            if (((words[2] >> 20u) & 2u) != ((words[2] >> 22u) & 2u)) fail(prefix + " and " + name + ", which holds the LOD at 0, filters anisotropically in only one of magnification and minification, which is not implemented");
+            if (((words[2] >> 20u) & 3u) != ((words[2] >> 22u) & 3u)) fail(prefix + " and " + name + ", which holds the LOD at 0, has different magnification and minification filters, between which the clamp moves the choice, which is not implemented");
             for (const auto& other : info.sampledPairs) {
                 if (other.sampler != pair.sampler || other.image == image) continue;
                 const auto otherName = "image " + std::to_string(other.image);

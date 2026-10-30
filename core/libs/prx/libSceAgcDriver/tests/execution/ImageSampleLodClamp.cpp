@@ -381,7 +381,7 @@ int main(int argc, char** argv) {
         for (const auto& item : {Case{0x200u, 0u, 0xfffu, 1u, -256}, Case{0x100u, 1u, 0xfffu, 1u, -128}}) RunAndCheck(*device, GradientCode, 1u, item, false);
         for (const auto& item : {Case{0u, 0u, 0xfffu, 1u, 256}, Case{0x100u, 1u, 0xfffu, 1u, -96}}) RunAndCheck(*device, Code, 6u, item, false);
         for (const auto& item : {Case{0x200u, 0u}, Case{0u, 0u}, Case{0x300u, 0u}, Case{0x200u, 1u}, Case{0x100u, 0u}}) RunAndCheck(*device, Code, 6u, item, true);
-        for (const auto& item : {Pairing{0x300u, 0u, {0u, 0u, 0u, 0u}}, Pairing{0x300u, 1u, {0u, 0u, 1u << 26u, 0u}}, Pairing{0x300u, 0u, {0u, 0u, 1u << 20u, 0u}}, Pairing{0x300u, 0u, {0u, 0u, 1u << 22u, 0u}}, Pairing{0x300u, 0u, {0u, 0u, 0x3f00u, 0u}}, Pairing{0x300u, 0u, {0u, 0u, 0u, 0u}, 0x300u, 4u}}) {
+        for (const auto& item : {Pairing{0x300u, 0u, {0u, 0u, 0u, 0u}}, Pairing{0x300u, 1u, {0u, 0u, 1u << 26u, 0u}}, Pairing{0x300u, 0u, {0u, 0u, (1u << 20u) | (1u << 22u), 0u}}, Pairing{0x300u, 0u, {0u, 0u, 0x3f00u, 0u}}, Pairing{0x300u, 0u, {0u, 0u, 0u, 0u}, 0x300u, 4u}}) {
             RunPairing(*device, item);
             CheckPairing(item);
         }
@@ -393,7 +393,7 @@ int main(int argc, char** argv) {
             RunPairing(*device, Pairing{0x140u, 0u, {0u, 0u, 2u << 26u, 0u}});
             CheckPairing(Pairing{0x140u, 0u, {0u, 0u, 2u << 26u, 0u}});
             RequireRejected(*device, Pairing{0x300u, 0u, {0u, 0u, 0u, 0u}, 0x100u, 4u}, "which holds the LOD at 0, also samples image 1 with another minimum LOD, which is not implemented");
-            RequireRejected(*device, Pairing{0x300u, 0u, {0u, 0u, 2u << 20u, 0u}}, "which holds the LOD at 0, filters anisotropically in only one of magnification and minification, which is not implemented");
+            for (const auto filters : {1u << 20u, 1u << 22u, 2u << 20u}) RequireRejected(*device, Pairing{0x300u, 0u, {0u, 0u, filters, 0u}}, "which holds the LOD at 0, has different magnification and minification filters, between which the clamp moves the choice, which is not implemented");
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, -256}, "to an explicit LOD that S# 0 biases by -256/256, which is not implemented");
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, 64}, "to an explicit LOD that S# 0 biases by 64/256, which is not implemented");
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, 0, 1u << 20u}, "and S# 0 has different magnification and minification filters");

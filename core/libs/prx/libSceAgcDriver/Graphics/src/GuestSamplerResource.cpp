@@ -180,7 +180,6 @@ bool HoldsLodAtZero(std::span<const std::uint32_t, 4> words) {
 std::array<std::uint32_t, 4> PinnedLodSamplerWords(std::span<const std::uint32_t, 4> words, std::uint32_t lod) {
     std::array<std::uint32_t, 4> pinned{words[0], (words[1] & ~0xffffffu) | lod | (lod << 12u), words[2], words[3]};
     if (((pinned[2] >> 26u) & 3u) == 0u) pinned[2] |= 1u << 26u;
-    pinned[2] = (pinned[2] & ~(3u << 22u)) | (((pinned[2] >> 20u) & 3u) << 22u);
     return pinned;
 }
 
