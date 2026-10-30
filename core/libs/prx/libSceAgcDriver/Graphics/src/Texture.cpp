@@ -6125,7 +6125,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                     if (!wholeLayers.empty() && wholeLayers.back().second == begin) wholeLayers.back().second = end;
                     else wholeLayers.emplace_back(begin, end);
                 }
-                if (wholeLayers == keep) directImport = segments.front().import;
+                if (wholeLayers == keep && HostImportDeviceLocal(context, *segments.front().import)) directImport = segments.front().import;
             }
         }
         const auto tiledScratch = directImport == nullptr ? std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT) : nullptr;
