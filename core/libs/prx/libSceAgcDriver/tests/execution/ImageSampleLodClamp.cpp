@@ -20,6 +20,14 @@
 #include <string>
 #include <vector>
 
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static bool ImageViewMinLod(const VulkanDevice& device) { return device.graphicsContext().imageViewMinLod; }
+};
+
+}
+
 namespace {
 
 using AgcDriver::Graphics::Require;
@@ -229,10 +237,10 @@ void RunAndCheck(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t>
     Check(item, results);
 }
 
-void RequireRejected(AgcDriver::VulkanDevice& device, const Case& item, const std::string& reason) {
+void RequireRejected(AgcDriver::VulkanDevice& device, const Case& item, const std::string& reason, std::span<const std::uint32_t> code = Code) {
     FillInput();
     try {
-        Run(device, Code, item, false);
+        Run(device, code, item, false);
     } catch (const std::exception& error) {
         Require(std::string(error.what()).find(reason) != std::string::npos, Describe(item) + " was rejected with \"" + error.what() + "\", expected \"" + reason + "\"");
         return;
@@ -283,21 +291,30 @@ int main(int argc, char** argv) {
             return VulkanTestSkipped;
         }
         const bool shaderClamp = device->Target().shaderImageMinLod;
-        Require(!shaderLane || shaderClamp, "--shader-lane needs a device that applies T# minimum LODs in the shader; run it with APS5_NO_IMAGE_VIEW_MIN_LOD and APS5_NO_GPL");
+        if (shaderLane && !shaderClamp) {
+            std::puts("skipped, the device does not apply T# minimum LODs in the shader under APS5_NO_IMAGE_VIEW_MIN_LOD and APS5_NO_GPL");
+            return VulkanTestSkipped;
+        }
+        if (!shaderClamp && !AgcDriver::VulkanDeviceTestAccess::ImageViewMinLod(*device)) {
+            std::puts("skipped, the device has no VK_EXT_image_view_min_lod, and graphics pipeline libraries keep T# minimum LODs out of the shader");
+            return VulkanTestSkipped;
+        }
         CheckSpirvLanes(device->Target());
         FillTexture();
         for (const auto& item : {Case{0u, 0u}, Case{0x200u, 0u}, Case{0x200u, 1u}, Case{0x200u, 0u, 0x300u}}) RunAndCheck(*device, Code, 6u, item, false);
-        for (const auto& item : {Case{0x200u, 0u, 0xfffu, 1u, -256}, Case{0x100u, 1u, 0xfffu, 1u, -128}}) RunAndCheck(*device, GradientCode, 1u, item, false);
+        RunAndCheck(*device, GradientCode, 1u, Case{0x100u, 1u, 0xfffu, 1u, -128}, false);
+        if (!shaderClamp) RunAndCheck(*device, GradientCode, 1u, Case{0x200u, 0u, 0xfffu, 1u, -256}, false);
         for (const auto& item : {Case{0u, 0u, 0xfffu, 1u, 256}, Case{0x100u, 1u, 0xfffu, 1u, -96}}) RunAndCheck(*device, Code, 6u, item, false);
         for (const auto& item : {Case{0x200u, 0u}, Case{0u, 0u}, Case{0x300u, 0u}, Case{0x200u, 1u}, Case{0x100u, 0u}}) RunAndCheck(*device, Code, 6u, item, true);
         if (shaderClamp) {
             for (const auto& item : {Case{0x1c0u, 0u}, Case{0x2c0u, 1u}}) RunAndCheck(*device, Code, 6u, item, false);
-            RunAndCheck(*device, GradientCode, 1u, Case{0x1c0u, 0u, 0xfffu, 1u, 128}, false);
+            RunAndCheck(*device, GradientCode, 1u, Case{0x1c0u, 0u}, false);
             for (const auto& item : {Case{0x1c0u, 0u}, Case{0u, 0u}, Case{0x2c0u, 1u}}) RunAndCheck(*device, Code, 6u, item, true);
             RequireRejected(*device, Case{0x200u, 0u, 0x100u}, "above the maximum LOD of 256/256 of S# 0, which is not implemented");
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 0u}, "above the maximum LOD of 0/256 of S# 0 (no mip filter), which is not implemented");
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, -256}, "to an explicit LOD that S# 0 biases by -256/256, which is not implemented");
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, 64}, "to an explicit LOD that S# 0 biases by 64/256, which is not implemented");
+            for (const auto bias : {-256, 128}) RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, bias}, "to an implicit or gradient LOD that S# 0 biases by " + std::to_string(bias) + "/256, which drivers clamp in different orders, which is not implemented", GradientCode);
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, 0, 1u << 20u}, "and S# 0 has different magnification and minification filters");
         }
         std::puts(shaderClamp ? "image sample LOD clamp tests passed in the shader-clamp lane" : "image sample LOD clamp tests passed in the image-view lane");
