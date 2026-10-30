@@ -6157,32 +6157,36 @@ bool smallTiledShadowLabelTests(const Device& device, Recorder& recorder) {
     Require(held == 32u * 32u * 4u, "the label readback did not publish the small tiled image");
 #ifdef __APPLE__
     if (std::getenv("APS5_NO_LABEL_READ_TRAP") == nullptr) {
-        const auto rewrite = [&](std::uint8_t value) {
-            auto source = std::make_shared<Buffer>(context, 32u * 32u * 4u, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        const auto rewriteImage = [&](const std::shared_ptr<StorageTexture>& target, std::uint32_t extent, std::uint8_t value) {
+            auto source = std::make_shared<Buffer>(context, extent * extent * 4u, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::fill(source->Bytes().begin(), source->Bytes().end(), std::byte{value});
             const auto commands = recorder.Commands();
-            recorder.Keep(image);
+            recorder.Keep(target);
             recorder.Keep(source);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
             VkBufferImageCopy copy{};
             copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.imageExtent = {32, 32, 1};
-            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, source->Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+            copy.imageExtent = {extent, extent, 1};
+            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, source->Handle(), target->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
-            image->MarkDirty();
+            target->MarkDirty();
+        };
+        const auto rewrite = [&](std::uint8_t value) { rewriteImage(image, 32u, value); };
+        const auto readUnlocked = [&](const std::function<bool()>& read) {
+            bool seen = false;
+            Require(GpuMutex().DepthOnThisThread() == 1, "the test thread holds the GPU mutex more than once");
+            GpuMutex().unlock();
+            std::thread reader([&] { seen = read(); });
+            reader.join();
+            GpuMutex().lock();
+            return seen;
         };
         const auto holds = [&](std::uint8_t value) { return static_cast<std::size_t>(std::count(memory + offset, memory + offset + layout.guestBytes, value)) == 32u * 32u * 4u; };
         rewrite(0x4b);
         StorageTexture::StoreReadbackBeforeLabel("readback before label");
         StorageTexture::StoreReadbackBeforeLabel("readback before label");
         Require(HostPageProtection(memory + offset) == VM_PROT_NONE, "a label stored a pending small tiled image instead of trapping its reads");
-        bool seen = false;
-        Require(GpuMutex().DepthOnThisThread() == 1, "the test thread holds the GPU mutex more than once");
-        GpuMutex().unlock();
-        std::thread reader([&] { seen = holds(0x4b); });
-        reader.join();
-        GpuMutex().lock();
-        Require(seen, "a read of a trapped image did not see its pending results");
+        Require(readUnlocked([&] { return holds(0x4b); }), "a read of a trapped image did not see its pending results");
         Require(HostPageProtection(memory + offset) != VM_PROT_NONE, "a resolved trap did not give back the image's pages");
         rewrite(0x2d);
         StorageTexture::StoreReadbackBeforeLabel("readback before label");
@@ -6191,6 +6195,57 @@ bool smallTiledShadowLabelTests(const Device& device, Recorder& recorder) {
         settle();
         Require(HostPageProtection(memory + offset) != VM_PROT_NONE, "storing a trapped image did not release its trap");
         Require(holds(0x2d), "storing a trapped image did not publish it");
+
+        rewrite(0x5e);
+        StorageTexture::StoreReadbackBeforeLabel("readback before label");
+        std::thread flusher([&] { static_cast<void>(StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(layout.guestBytes), nullptr, "memory access", PublishScope::None)); });
+        while (StorageTexture::AnyPending()) std::this_thread::yield();
+        Require(HostPageProtection(memory + offset) == VM_PROT_NONE, "a trapped image taken for a store gave back its pages before the store");
+        bool fresh = false;
+        std::thread waiting([&] { fresh = holds(0x5e); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        GpuMutex().unlock();
+        flusher.join();
+        waiting.join();
+        GpuMutex().lock();
+        Require(fresh, "a read while a trapped image waited for its store did not see the stored results");
+
+        const auto page = static_cast<std::uint64_t>(::getpagesize());
+        auto linearA = resource;
+        linearA.baseAddress = address + 0xd0000;
+        linearA.width = 8;
+        linearA.height = 8;
+        linearA.tileMode = TextureTileMode::kLinear;
+        const auto layoutA = DescribeSurface(linearA);
+        auto linearB = linearA;
+        linearB.baseAddress = linearA.baseAddress + ((layoutA.guestBytes + 255u) & ~std::uint64_t{255});
+        const auto layoutB = DescribeSurface(linearB);
+        Require(linearA.baseAddress / page == (linearB.baseAddress + layoutB.guestBytes - 1) / page && linearB.baseAddress + layoutB.guestBytes <= address + 0xe0000, "the two small linear surfaces do not share a page");
+        auto imageA = StorageTexture::Create(context, detiler, linearA, 0);
+        auto imageB = StorageTexture::Create(context, detiler, linearB, 0);
+        imageA->Refresh();
+        imageB->Refresh();
+        settle();
+        auto* pageBytes = memory + (linearA.baseAddress - address);
+        const auto holdsIn = [&](const GuestTextureResource& surface, std::size_t bytes, std::uint8_t value) { return static_cast<std::size_t>(std::count(memory + (surface.baseAddress - address), memory + (surface.baseAddress - address) + bytes, value)) >= 8u * 8u * 4u; };
+        rewriteImage(imageA, 8u, 0x61);
+        StorageTexture::StoreReadbackBeforeLabel("readback before label");
+        Require(HostPageProtection(pageBytes) == VM_PROT_NONE, "a label did not trap a lone pending linear image");
+        rewriteImage(imageB, 8u, 0x62);
+        StorageTexture::StoreReadbackBeforeLabel("readback before label");
+        settle();
+        Require(HostPageProtection(pageBytes) != VM_PROT_NONE, "a label left a trap on a page it stored another image on");
+        Require(holdsIn(linearA, static_cast<std::size_t>(layoutA.guestBytes), 0x61) && holdsIn(linearB, static_cast<std::size_t>(layoutB.guestBytes), 0x62), "a label did not store both images on a shared page");
+        rewriteImage(imageA, 8u, 0x63);
+        StorageTexture::StoreReadbackBeforeLabel("readback before label");
+        Require(HostPageProtection(pageBytes) == VM_PROT_NONE, "a label did not trap a lone pending linear image again");
+        rewriteImage(imageB, 8u, 0x64);
+        Require(StorageTexture::FlushPending(linearB.baseAddress, static_cast<std::size_t>(layoutB.guestBytes), nullptr, "idle", PublishScope::None), "a CPU store next to a trapped image stored nothing");
+        settle();
+        Require(HostPageProtection(pageBytes) != VM_PROT_NONE && holdsIn(linearB, static_cast<std::size_t>(layoutB.guestBytes), 0x64), "a CPU store next to a trapped image did not store through its page");
+        StorageTexture::StoreReadbackBeforeLabel("readback before label");
+        Require(HostPageProtection(pageBytes) == VM_PROT_NONE, "a label did not trap the image a neighbouring CPU store left pending");
+        Require(readUnlocked([&] { return holdsIn(linearA, static_cast<std::size_t>(layoutA.guestBytes), 0x63); }), "a read of the re-trapped image did not see its pending results");
     }
 #endif
     auto large = resource;
