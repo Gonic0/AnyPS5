@@ -198,7 +198,6 @@ void RequireShaderMinLod(const ShaderInfo& info, const ResourceSnapshot& snapsho
         if ((((words[2] >> 20u) ^ (words[2] >> 22u)) & 1u) != 0u) fail(prefix + " and " + name + " has different magnification and minification filters, between which the clamp moves the choice, which is not implemented");
         const auto bias = static_cast<std::int32_t>(((words[2] & 0x3fffu) ^ 0x2000u) - 0x2000u);
         if (bias != 0 && (sampler.uses & SamplerUseExplicitLod) != 0u) fail(prefix + " to an explicit LOD that " + name + " biases by " + std::to_string(bias) + "/256, which is not implemented");
-        if (bias != 0 && (sampler.uses & (SamplerUseImplicitLod | SamplerUseGradient)) != 0u) fail(prefix + " to an implicit or gradient LOD that " + name + " biases by " + std::to_string(bias) + "/256, which drivers clamp in different orders, which is not implemented");
     }
 }
 

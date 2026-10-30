@@ -314,7 +314,6 @@ int main(int argc, char** argv) {
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 0u}, "above the maximum LOD of 0/256 of S# 0 (no mip filter), which is not implemented");
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, -256}, "to an explicit LOD that S# 0 biases by -256/256, which is not implemented");
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, 64}, "to an explicit LOD that S# 0 biases by 64/256, which is not implemented");
-            for (const auto bias : {-256, 128}) RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, bias}, "to an implicit or gradient LOD that S# 0 biases by " + std::to_string(bias) + "/256, which drivers clamp in different orders, which is not implemented", GradientCode);
             RequireRejected(*device, Case{0x200u, 0u, 0xfffu, 1u, 0, 1u << 20u}, "and S# 0 has different magnification and minification filters");
         }
         std::puts(shaderClamp ? "image sample LOD clamp tests passed in the shader-clamp lane" : "image sample LOD clamp tests passed in the image-view lane");
