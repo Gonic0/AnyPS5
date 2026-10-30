@@ -1,5 +1,6 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -7,11 +8,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <mach/mach.h>
@@ -336,6 +339,219 @@ void CheckThreads() {
     Require(region.Collect().empty(), "writes are reported after the writers stopped");
 }
 
+int PageProtection(const void* page) {
+    mach_vm_address_t address = reinterpret_cast<mach_vm_address_t>(page);
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    Require(mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) == KERN_SUCCESS && address <= reinterpret_cast<mach_vm_address_t>(page), "cannot read the kernel protection of a page");
+    return ((info.protection & VM_PROT_READ) ? PROT_READ : 0) | ((info.protection & VM_PROT_WRITE) ? PROT_WRITE : 0) | ((info.protection & VM_PROT_EXECUTE) ? PROT_EXEC : 0);
+}
+
+struct TrapLog {
+    std::mutex mutex;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> calls;
+    std::vector<std::thread::id> threads;
+    std::atomic<std::uint8_t> fill{0};
+    std::atomic<std::ptrdiff_t> alias{0};
+    std::atomic<bool> bracket{false};
+};
+
+TrapLog& Traps() {
+    static TrapLog log;
+    return log;
+}
+
+void ResolveTrap(std::uintptr_t begin, std::uintptr_t end) {
+    auto& log = Traps();
+    {
+        const std::lock_guard lock(log.mutex);
+        log.calls.emplace_back(begin, end);
+        log.threads.push_back(std::this_thread::get_id());
+    }
+    if (log.bracket) GuestWriteWatchBeginHostWrite_nid_postfix(reinterpret_cast<void*>(begin), end - begin);
+    std::memset(reinterpret_cast<void*>(begin + log.alias.load()), log.fill.load(), end - begin);
+    if (log.bracket) GuestWriteWatchEndHostWrite_nid_postfix(reinterpret_cast<void*>(begin), end - begin);
+    GuestWriteWatchReleaseReads_nid_postfix(begin, end - begin);
+}
+
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> TakeTrapCalls(std::vector<std::thread::id>* threads = nullptr) {
+    auto& log = Traps();
+    const std::lock_guard lock(log.mutex);
+    if (threads != nullptr) *threads = log.threads;
+    log.threads.clear();
+    return std::exchange(log.calls, {});
+}
+
+std::uint8_t ReadOnThread(const std::uint8_t* address, std::thread::id* reader = nullptr) {
+    std::uint8_t value = 0;
+    std::thread([&] {
+        value = *reinterpret_cast<const volatile std::uint8_t*>(address);
+        if (reader != nullptr) *reader = std::this_thread::get_id();
+    }).join();
+    return value;
+}
+
+void CheckReadTrap() {
+    ::alarm(20);
+    Region region(10);
+    Region unregistered(1);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    Require(region.Collect() == All(10), "a new range is not reported in full");
+    const auto page = region.page;
+    Require(!GuestWriteWatchTrapReads_nid_postfix(region.Address(1), page), "a read trap was set without a resolver");
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+    Require(!GuestWriteWatchTrapReads_nid_postfix(unregistered.Address(0), page), "a read trap was set on unwatched memory");
+    Require(!GuestWriteWatchTrapReads_nid_postfix(region.Address(1), 0), "an empty read trap was set");
+
+    auto& log = Traps();
+    log.fill = 0xa5;
+    const auto begin = region.Address(1) + 100;
+    Require(GuestWriteWatchTrapReads_nid_postfix(begin, page), "cannot set a read trap");
+    Require(PageProtection(region.base + page) == PROT_NONE && PageProtection(region.base + 2 * page) == PROT_NONE, "a read trap does not take the access to its pages");
+    Require(PageProtection(region.base) == PROT_READ && PageProtection(region.base + 3 * page) == PROT_READ, "a read trap changes pages outside its range");
+    std::thread::id reader;
+    Require(ReadOnThread(region.base + page + 105, &reader) == 0xa5, "a read of a trapped page does not see the resolver's bytes");
+    std::vector<std::thread::id> threads;
+    Require(TakeTrapCalls(&threads) == std::vector<std::pair<std::uintptr_t, std::uintptr_t>>{{begin, begin + page}}, "a trapped read does not resolve its range exactly once");
+    Require(threads.size() == 1 && threads[0] != reader && threads[0] != std::this_thread::get_id(), "a trapped read is not resolved on the resolver thread");
+    Require(PageProtection(region.base + page) == (PROT_READ | PROT_WRITE) && PageProtection(region.base + 2 * page) == (PROT_READ | PROT_WRITE), "the resolver's writes to its resolved pages are not let through");
+    Require(ReadOnThread(region.base + 2 * page) == 0xa5 && TakeTrapCalls().empty(), "a resolved read trap resolves again");
+    Require(region.Collect() == std::set<std::size_t>({1, 2}), "the resolver's writes are not reported");
+
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(3), page), "cannot set a read trap");
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(3), page);
+    Require(PageProtection(region.base + 3 * page) == PROT_READ, "a released read trap does not give back the watch's protection");
+    Require(ReadOnThread(region.base + 3 * page) == 0 && TakeTrapCalls().empty(), "a released read trap resolves");
+
+    log.fill = 0x11;
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(4), page), "cannot set a read trap");
+    region.base[4 * page] = 0x77;
+    Require(region.base[4 * page] == 0x77 && region.base[4 * page + 1] == 0x11, "a write to a trapped page does not land after the resolver's bytes");
+    Require(TakeTrapCalls().size() == 1, "a write to a trapped page does not resolve it once");
+    Require(region.Collect() == std::set<std::size_t>({4}), "a write to a trapped page is not reported");
+
+    region.base[5 * page] = 1;
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(5), page), "cannot set a read trap");
+    Require(region.Collect() == std::set<std::size_t>({5}), "a written trapped page is not reported");
+    Require(PageProtection(region.base + 5 * page) == PROT_NONE, "a collection gives back the access to a trapped page");
+    Require(ReadOnThread(region.base + 5 * page) == 0x11 && TakeTrapCalls().size() == 1, "a trapped page read after a collection is not resolved");
+
+    log.fill = 0x22;
+    const auto half = page / 2;
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(6), half), "cannot set a read trap");
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(6) + half, page), "cannot set a read trap");
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(6), half);
+    Require(PageProtection(region.base + 6 * page) == PROT_NONE, "releasing one read trap gives back a page another one still traps");
+    Require(ReadOnThread(region.base + 6 * page) == 0, "a page shared by two read traps does not keep the released trap's bytes");
+    Require(TakeTrapCalls() == std::vector<std::pair<std::uintptr_t, std::uintptr_t>>{{region.Address(6) + half, region.Address(7) + half}}, "a read of a shared page does not resolve exactly the trap still set");
+
+    log.fill = 0x33;
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(8), page), "cannot set a read trap");
+    GuestWriteWatchBeginHostWrite_nid_postfix(region.base + 8 * page, 8);
+    Require(TakeTrapCalls(&threads).size() == 1 && threads[0] == std::this_thread::get_id(), "a host write over a trapped page does not resolve it first on its own thread");
+    Require(!GuestWriteWatchTrapReads_nid_postfix(region.Address(8), page), "a read trap was set under a host write");
+    int descriptors[2];
+    Require(::pipe(descriptors) == 0, "cannot create a pipe");
+    const std::array<char, 8> payload{'t', 'r', 'a', 'p', 'p', 'e', 'd', '!'};
+    Require(::write(descriptors[1], payload.data(), payload.size()) == static_cast<ssize_t>(payload.size()), "cannot fill the pipe");
+    Require(::read(descriptors[0], region.base + 8 * page, payload.size()) == static_cast<ssize_t>(payload.size()), "a system call cannot write a page whose read trap a host write resolved");
+    GuestWriteWatchEndHostWrite_nid_postfix(region.base + 8 * page, 8);
+    ::close(descriptors[0]);
+    ::close(descriptors[1]);
+    Require(std::memcmp(region.base + 8 * page, payload.data(), payload.size()) == 0 && region.base[8 * page + 8] == 0x33, "a host write over a resolved trap lost bytes");
+
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(9), page), "cannot set a read trap");
+    Require(GuestWriteWatchProtect_nid_postfix(region.base + 9 * page, page, PROT_READ) == 0, "cannot protect a trapped page");
+    Require(TakeTrapCalls().size() == 1 && PageProtection(region.base + 9 * page) == PROT_READ, "a protect of a trapped page does not resolve it and apply the new protection");
+
+    log.fill = 0x44;
+    log.bracket = true;
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(3), page), "cannot set a read trap");
+    Require(ReadOnThread(region.base + 3 * page) == 0x44 && TakeTrapCalls().size() == 1, "a resolver that brackets its stores as a host write does not resolve its trap");
+    log.bracket = false;
+
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(0), page), "cannot set a read trap");
+    Require(GuestWriteWatchUnregister_nid_postfix(region.base, region.bytes), "cannot unregister the test region");
+    Require(PageProtection(region.base) == (PROT_READ | PROT_WRITE), "unregistering a trapped page does not give back its protection");
+    Require(ReadOnThread(region.base) == 0 && TakeTrapCalls().empty(), "an unregistered read trap resolves");
+    ::alarm(0);
+}
+
+void CheckReadTrapFaults() {
+    const auto bytes = static_cast<std::size_t>(::getpagesize());
+    for (const bool resolved : {false, true}) {
+        const auto child = ::fork();
+        Require(child >= 0, "cannot fork a faulting child");
+        if (child == 0) {
+            ::alarm(2);
+            Region trapped(1);
+            GuestWriteWatchRegister_nid_postfix(trapped.base, trapped.bytes);
+            if (!GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap) || !GuestWriteWatchTrapReads_nid_postfix(trapped.Address(0), trapped.page)) ::_exit(2);
+            if (resolved) static_cast<void>(*reinterpret_cast<const volatile std::uint8_t*>(trapped.base));
+            char path[] = "/tmp/anyps5-write-watch-XXXXXX";
+            const int file = ::mkstemp(path);
+            if (file < 0) ::_exit(2);
+            ::unlink(path);
+            if (::ftruncate(file, static_cast<off_t>(bytes)) != 0) ::_exit(2);
+            auto* mapped = static_cast<std::uint8_t*>(::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0));
+            if (mapped == MAP_FAILED || ::ftruncate(file, 0) != 0) ::_exit(2);
+            ::close(file);
+            GuestWriteWatchRegister_nid_postfix(mapped, bytes);
+            static_cast<void>(*reinterpret_cast<const volatile std::uint8_t*>(mapped));
+            ::_exit(3);
+        }
+        int status = 0;
+        Require(::waitpid(child, &status, 0) == child, "cannot wait for a faulting child");
+        Require(WIFSIGNALED(status) && (WTERMSIG(status) == SIGBUS || WTERMSIG(status) == SIGSEGV), "a read fault on a mapping with missing backing is not delivered while read traps are set");
+    }
+}
+
+void CheckReadTrapThreads() {
+    ::alarm(20);
+    constexpr std::size_t Threads = 4;
+    constexpr std::size_t PagesPerThread = 8;
+    Region region(Threads * PagesPerThread);
+    char path[] = "/tmp/anyps5-read-trap-XXXXXX";
+    const int file = ::mkstemp(path);
+    Require(file >= 0, "cannot create the shared backing");
+    ::unlink(path);
+    Require(::ftruncate(file, static_cast<off_t>(region.bytes)) == 0, "cannot size the shared backing");
+    Require(::mmap(region.base, region.bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, file, 0) == region.base, "cannot map the shared backing");
+    auto* alias = static_cast<std::uint8_t*>(::mmap(nullptr, region.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0));
+    Require(alias != MAP_FAILED, "cannot map the second view of the shared backing");
+    ::close(file);
+    Traps().alias = alias - region.base;
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    static_cast<void>(region.Collect());
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+    Traps().fill = 0x5a;
+    for (std::size_t index = 0; index < Threads * PagesPerThread; ++index)
+        Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(index), region.page), "cannot set a read trap");
+    std::atomic<bool> start{false};
+    std::atomic<std::size_t> wrong{0};
+    std::array<std::thread, Threads> readers;
+    for (std::size_t thread = 0; thread < Threads; ++thread) {
+        readers[thread] = std::thread([&, thread] {
+            while (!start.load()) std::this_thread::yield();
+            for (std::size_t index = 0; index < Threads * PagesPerThread; ++index) {
+                const auto page = (index + (thread % 2) * PagesPerThread) % (Threads * PagesPerThread);
+                if (*reinterpret_cast<const volatile std::uint8_t*>(region.base + page * region.page + thread) != 0x5a) wrong.fetch_add(1);
+            }
+        });
+    }
+    start.store(true);
+    for (auto& reader : readers) reader.join();
+    Require(wrong.load() == 0, "a concurrent read of a trapped page does not see the resolver's bytes");
+    auto calls = TakeTrapCalls();
+    std::sort(calls.begin(), calls.end());
+    Require(calls.size() == Threads * PagesPerThread && std::adjacent_find(calls.begin(), calls.end()) == calls.end(), "concurrent reads do not resolve each trap exactly once");
+    Traps().alias = 0;
+    ::munmap(alias, region.bytes);
+    ::alarm(0);
+}
+
 void CheckRaisedSignals() {
     Require(GuestWriteWatchAvailable_nid_postfix(), "write watch is unavailable");
     for (const int signal : {SIGBUS, SIGSEGV}) {
@@ -355,7 +571,7 @@ void CheckRaisedSignals() {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads or raised");
+        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads, raised, read-trap, read-trap-threads or read-trap-fault");
         const std::string_view mode(argv[1]);
         if (mode == "collect") CheckCollect();
         else if (mode == "fresh") CheckFresh();
@@ -370,6 +586,9 @@ int main(int argc, char** argv) {
         else if (mode == "overlaps") CheckOverlaps();
         else if (mode == "threads") CheckThreads();
         else if (mode == "raised") CheckRaisedSignals();
+        else if (mode == "read-trap") CheckReadTrap();
+        else if (mode == "read-trap-threads") CheckReadTrapThreads();
+        else if (mode == "read-trap-fault") CheckReadTrapFaults();
         else throw std::runtime_error("unknown write watch test");
         std::printf("write watch %s passed\n", argv[1]);
         return 0;
