@@ -421,9 +421,9 @@ void CheckReadTrap() {
     Require(ReadOnThread(region.base + 2 * page) == 0xa5 && TakeTrapCalls().empty(), "a resolved read trap resolves again");
     Require(region.Collect() == std::set<std::size_t>({1, 2}), "the resolver's writes are not reported");
 
-    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(3), page), "cannot set a read trap");
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(3), page) && GuestWriteWatchTrapReads_nid_postfix(region.Address(3), page), "cannot set a read trap twice");
     GuestWriteWatchReleaseReads_nid_postfix(region.Address(3), page);
-    Require(PageProtection(region.base + 3 * page) == PROT_READ, "a released read trap does not give back the watch's protection");
+    Require(PageProtection(region.base + 3 * page) == PROT_READ, "a released read trap set twice does not give back the watch's protection");
     Require(ReadOnThread(region.base + 3 * page) == 0 && TakeTrapCalls().empty(), "a released read trap resolves");
 
     log.fill = 0x11;

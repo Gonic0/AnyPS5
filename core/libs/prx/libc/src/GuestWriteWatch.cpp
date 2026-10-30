@@ -511,6 +511,8 @@ public:
         const auto last = pageEnd(end);
         const Lock lock(_lock);
         if (!covers(first, last)) return false;
+        const auto [same, other] = _traps.equal_range(begin);
+        if (std::any_of(same, other, [&](const auto& trap) { return trap.second == end; })) return true;
         for (const auto& [hostBegin, hostEnd] : _hostWrites)
             if (hostBegin < last && first < hostEnd) return false;
         if (::mprotect(reinterpret_cast<void*>(first), last - first, PROT_NONE) != 0) return false;
