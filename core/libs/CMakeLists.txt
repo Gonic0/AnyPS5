@@ -633,6 +633,16 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceVoice>")
     endif()
 
+    add_test_executable(guest_remoteplay_tests tests/GuestRemoteplay.cpp)
+    target_include_directories(guest_remoteplay_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_remoteplay_tests PRIVATE libSceRemoteplay libc)
+    configure_windows_unwind(guest_remoteplay_tests)
+    add_test(NAME guest_remoteplay COMMAND guest_remoteplay_tests)
+    if(WIN32)
+        set_tests_properties(guest_remoteplay PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceRemoteplay>")
+    endif()
+
     add_test_executable(guest_gnm_neo_retail_tests tests/GuestGnmNeoRetail.cpp)
     target_include_directories(guest_gnm_neo_retail_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_gnm_neo_retail_tests PRIVATE libSceGnmDriverForNeoMode libc)
