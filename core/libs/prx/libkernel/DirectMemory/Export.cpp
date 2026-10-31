@@ -543,16 +543,21 @@ int APS5_VABI sceKernelGetPageTableStats(int* cpu_total, int* cpu_available, int
  std::uint64_t cpuUsed = 0;
  std::uint64_t gpuUsed = 0;
  GuestPageTableUsage(PageTableGranularity, &cpuUsed, &gpuUsed);
- *cpu_total = static_cast<int>(PageTablePoolEntries);
- *gpu_total = static_cast<int>(PageTablePoolEntries);
- *cpu_available = static_cast<int>(cpuUsed >= PageTablePoolEntries ? 0 : PageTablePoolEntries - cpuUsed);
- *gpu_available = static_cast<int>(gpuUsed >= PageTablePoolEntries ? 0 : PageTablePoolEntries - gpuUsed);
+ const int total = static_cast<int>(PageTablePoolEntries);
+ const int cpuAvail = static_cast<int>(cpuUsed >= PageTablePoolEntries ? 0 : PageTablePoolEntries - cpuUsed);
+ const int gpuAvail = static_cast<int>(gpuUsed >= PageTablePoolEntries ? 0 : PageTablePoolEntries - gpuUsed);
+ if (!GuestCopyOut_nid_no_patch(cpu_total, &total, sizeof(total)) ||
+     !GuestCopyOut_nid_no_patch(gpu_total, &total, sizeof(total)) ||
+     !GuestCopyOut_nid_no_patch(cpu_available, &cpuAvail, sizeof(cpuAvail)) ||
+     !GuestCopyOut_nid_no_patch(gpu_available, &gpuAvail, sizeof(gpuAvail)))
+  return SCE_KERNEL_ERROR_EFAULT;
  return 0;
 }
 
 int APS5_VABI sceKernelGetTraceMemoryStats(std::uint64_t* first, std::uint64_t* second) {
- if (first) *first = 0;
- if (second) *second = 0;
+ constexpr std::uint64_t zero = 0;
+ if (first != nullptr && !GuestCopyOut_nid_no_patch(first, &zero, sizeof(zero))) return SCE_KERNEL_ERROR_EFAULT;
+ if (second != nullptr && !GuestCopyOut_nid_no_patch(second, &zero, sizeof(zero))) return SCE_KERNEL_ERROR_EFAULT;
  return 0;
 }
 

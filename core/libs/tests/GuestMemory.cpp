@@ -151,6 +151,11 @@ static void CheckPageTableStats() {
     Require(sceKernelGetPageTableStats(&cpuTotal, nullptr, &gpuTotal, &gpuAvailable) == SCE_KERNEL_ERROR_EFAULT);
     Require(sceKernelGetPageTableStats(&cpuTotal, &cpuAvailable, nullptr, &gpuAvailable) == SCE_KERNEL_ERROR_EFAULT);
     Require(sceKernelGetPageTableStats(&cpuTotal, &cpuAvailable, &gpuTotal, nullptr) == SCE_KERNEL_ERROR_EFAULT);
+    auto* bad = reinterpret_cast<int*>(0x10);
+    Require(sceKernelGetPageTableStats(bad, &cpuAvailable, &gpuTotal, &gpuAvailable) == SCE_KERNEL_ERROR_EFAULT);
+    Require(sceKernelGetPageTableStats(&cpuTotal, bad, &gpuTotal, &gpuAvailable) == SCE_KERNEL_ERROR_EFAULT);
+    Require(sceKernelGetPageTableStats(&cpuTotal, &cpuAvailable, bad, &gpuAvailable) == SCE_KERNEL_ERROR_EFAULT);
+    Require(sceKernelGetPageTableStats(&cpuTotal, &cpuAvailable, &gpuTotal, bad) == SCE_KERNEL_ERROR_EFAULT);
 }
 
 static void CheckInternalMemoryAvailableSize() {
