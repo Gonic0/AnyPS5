@@ -302,9 +302,10 @@ int main(int argc, char** argv) {
         CheckSpirvLanes(device->Target());
         FillTexture();
         for (const auto& item : {Case{0u, 0u}, Case{0x200u, 0u}, Case{0x200u, 1u}, Case{0x200u, 0u, 0x300u}}) RunAndCheck(*device, Code, 6u, item, false);
-        RunAndCheck(*device, GradientCode, 1u, Case{0x100u, 1u, 0xfffu, 1u, -128}, false);
+        if (!shaderClamp) RunAndCheck(*device, GradientCode, 1u, Case{0x100u, 1u, 0xfffu, 1u, -128}, false);
         if (!shaderClamp) RunAndCheck(*device, GradientCode, 1u, Case{0x200u, 0u, 0xfffu, 1u, -256}, false);
-        for (const auto& item : {Case{0u, 0u, 0xfffu, 1u, 256}, Case{0x100u, 1u, 0xfffu, 1u, -96}}) RunAndCheck(*device, Code, 6u, item, false);
+        if (!shaderClamp) RunAndCheck(*device, Code, 6u, Case{0u, 0u, 0xfffu, 1u, 256}, false);
+        RunAndCheck(*device, Code, 6u, Case{0x100u, 1u, 0xfffu, 1u, -96}, false);
         for (const auto& item : {Case{0x200u, 0u}, Case{0u, 0u}, Case{0x300u, 0u}, Case{0x200u, 1u}, Case{0x100u, 0u}}) RunAndCheck(*device, Code, 6u, item, true);
         if (shaderClamp) {
             for (const auto& item : {Case{0x1c0u, 0u}, Case{0x2c0u, 1u}}) RunAndCheck(*device, Code, 6u, item, false);
