@@ -494,6 +494,7 @@ private:
     static constexpr std::uint8_t Written = 0x10;
     static constexpr std::uint8_t Protected = 0x20;
     static constexpr std::uint8_t Fresh = 0x40;
+    static constexpr std::uintptr_t FaultAheadBlock = 65536;
 
     struct Range {
         std::uintptr_t end;
@@ -600,7 +601,9 @@ private:
             const auto writtenOpen = [&](std::size_t at) { return (pages[at] & (Written | Protected)) == Written && (pages[at] & ProtectionMask) == protection; };
             std::size_t count = 1;
             if (_faultAhead > 1 && index >= 2 && writtenOpen(index - 1) && writtenOpen(index - 2)) {
-                while (count < _faultAhead && index + count < pages.size() && (pages[index + count] & Protected) != 0 && (pages[index + count] & ProtectionMask) == protection) ++count;
+                const auto blockPages = static_cast<std::size_t>(((page | (FaultAheadBlock - 1)) + 1 - page) / _page);
+                const auto limit = std::min({_faultAhead, blockPages, pages.size() - index});
+                while (count < limit && (pages[index + count] & Protected) != 0 && (pages[index + count] & ProtectionMask) == protection) ++count;
             }
             if (::mprotect(reinterpret_cast<void*>(page), count * _page, protection) != 0) return false;
             for (std::size_t at = index; at < index + count; ++at) pages[at] = static_cast<std::uint8_t>((pages[at] & (ProtectionMask | Fresh)) | Written);
