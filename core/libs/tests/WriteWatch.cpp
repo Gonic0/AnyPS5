@@ -351,11 +351,52 @@ void CheckRaisedSignals() {
     }
 }
 
+
+std::set<std::size_t> Span(std::size_t first, std::size_t last) {
+    std::set<std::size_t> pages;
+    for (auto index = first; index <= last; ++index) pages.insert(index);
+    return pages;
+}
+
+void CheckFaultAhead(bool enabled) {
+    Region region(80);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    static_cast<void>(region.Collect());
+    const auto write = [&](std::initializer_list<std::size_t> pages, std::uint8_t value) {
+        for (const auto index : pages) region.base[index * region.page + 5] = value;
+    };
+    write({10, 11}, 1);
+    Require(region.Collect() == std::set<std::size_t>({10, 11}), "writes to two adjacent pages are not reported exactly");
+    write({20, 21, 22}, 2);
+    Require(region.Collect() == (enabled ? Span(20, 53) : Span(20, 22)), enabled ? "a third sequential write fault does not open the next 31 pages" : "with fault-ahead off, sequential writes are not reported exactly");
+    Require(region.base[20 * region.page + 5] == 2 && region.base[22 * region.page + 5] == 2, "sequential writes were lost");
+    write({23, 40}, 3);
+    Require(region.Collect() == std::set<std::size_t>({23, 40}), "writes after a collection are not reported exactly");
+    write({30}, 4);
+    write({26, 27, 28}, 4);
+    Require(region.Collect() == (enabled ? Span(26, 30) : std::set<std::size_t>({26, 27, 28, 30})), "fault-ahead does not stop at a page that is already writable");
+    Require(GuestWriteWatchProtect_nid_postfix(region.base + 60 * region.page, region.page, PROT_READ) == 0, "cannot protect a watched page");
+    static_cast<void>(region.Collect());
+    write({56, 57, 58}, 5);
+    Require(region.Collect() == (enabled ? Span(56, 59) : Span(56, 58)), "fault-ahead does not stop at a read-only page");
+    if (GuestWriteWatchProtect_nid_postfix(region.base + 66 * region.page, region.page, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+        static_cast<void>(region.Collect());
+        write({62, 63, 64}, 7);
+        Require(region.Collect() == (enabled ? Span(62, 65) : Span(62, 64)), "fault-ahead does not stop at a writable page with another protection");
+        Require(KernelProtection(region.base + 66 * region.page) == (PROT_READ | PROT_EXEC), "fault-ahead changed the protection of a page with another one");
+        region.base[66 * region.page + 5] = 7;
+        Require(region.Collect() == std::set<std::size_t>({66}), "a write to an executable watched page is not reported");
+    }
+    write({77, 78, 79}, 6);
+    Require(region.Collect() == Span(77, 79), "fault-ahead reaches past the end of a watched range");
+    Require(region.base[79 * region.page + 5] == 6 && region.base[60 * region.page + 5] == 0, "writes near the range end were lost");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads or raised");
+        Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads, raised, fault-ahead or fault-ahead-off");
         const std::string_view mode(argv[1]);
         if (mode == "collect") CheckCollect();
         else if (mode == "fresh") CheckFresh();
@@ -370,6 +411,8 @@ int main(int argc, char** argv) {
         else if (mode == "overlaps") CheckOverlaps();
         else if (mode == "threads") CheckThreads();
         else if (mode == "raised") CheckRaisedSignals();
+        else if (mode == "fault-ahead") CheckFaultAhead(true);
+        else if (mode == "fault-ahead-off") CheckFaultAhead(false);
         else throw std::runtime_error("unknown write watch test");
         std::printf("write watch %s passed\n", argv[1]);
         return 0;
