@@ -24,12 +24,16 @@ def module_with_symbol(exported, symbolic=False):
     return image
 
 
-def module_with_soname(soname):
+def module_with_soname(soname, duplicate_alias=False):
     image = module_with_symbol(True)
-    strings = b"\0shared#A#B\0" + soname.encode() + b"\0"
+    alias = b"shared#C#B\0" if duplicate_alias else b""
+    strings = b"\0shared#A#B\0" + alias + soname.encode() + b"\0"
     image[0x800:0x800 + len(strings)] = strings
+    if duplicate_alias:
+        struct.pack_into("<II", image, 0x840, 1, 3)
+        struct.pack_into("<IBBHQQ", image, 0x8B0, 12, 0x12, 0, 1, 0x1000, 1)
     dynamic(image, 0x600, 176, [(5, 0x2200), (10, len(strings)), (6, 0x2280), (11, 24),
-                                (4, 0x2240), (7, 0x2300), (8, 0), (9, 24), (14, 12)])
+                                (4, 0x2240), (7, 0x2300), (8, 0), (9, 24), (14, 12 + len(alias))])
     return image
 
 
@@ -94,7 +98,7 @@ def main():
                 prx.mkdir(parents=True)
                 provider = (case / standard) if standard else prx
                 provider.mkdir(exist_ok=True)
-                (provider / "provider.prx").write_bytes(module_with_symbol(True, symbolic=not windows))
+                (provider / "provider.prx").write_bytes(module_with_symbol(True, symbolic=True))
                 (prx / "consumer.prx").write_bytes(module_with_symbol(False))
                 (prx / "ignored.txt").write_text("not ELF")
                 (prx / "old.prx.guest.prx").write_bytes(guest_fixture(PLAIN_SITE))
@@ -167,6 +171,20 @@ def main():
                 assert result.stdout.count(skipped) == 1, result.stdout
             assert {path.name for path in (case / "app0").rglob("*.guest.prx")} == {"libSceFace.prx.guest.prx"}
 
+            case = work / f"{windows}-backup-alias"
+            (case / "sce_module").mkdir(parents=True)
+            for name in ("libSceFace.prx", "libSceFace.prx.esbak"):
+                (case / "sce_module" / name).write_bytes(module_with_soname("libSceFace.prx", True))
+            result, output = convert(case, windows)
+            skipped = "Skipping backup copy: sce_module/libSceFace.prx.esbak (same SONAME as sce_module/libSceFace.prx)"
+            assert result.stdout.count(skipped) == 1, result.stdout
+            if windows:
+                assert result.returncode == 0 and output.exists(), (result.stdout, result.stderr)
+                assert {path.name for path in (case / "app0").rglob("*.guest.prx")} == {"libSceFace.prx.guest.prx"}
+            else:
+                assert result.returncode == 2 and "Duplicate or empty export after stripping #: shared" in result.stderr, result.stderr
+                assert not output.exists() and not (case / "app0").exists(), output
+
             case = work / f"{windows}-prefixed-libraries"
             (case / "sce_module").mkdir(parents=True)
             for name in ("libfoo.so.1", "libfoo.so.10"):
@@ -209,12 +227,6 @@ def main():
             assert result.returncode == 2 and "Ambiguous guest import" in result.stderr and "shared" in result.stderr, result.stderr
             assert not output.exists() and not (case / "app0").exists(), output
 
-        case = work / "windows-symbolic"
-        (case / "prx").mkdir(parents=True)
-        (case / "prx" / "provider.prx").write_bytes(module_with_symbol(True, symbolic=True))
-        result, output = convert(case, True)
-        assert result.returncode == 2 and "DF_SYMBOLIC" in result.stderr, result.stderr
-        assert not output.exists(), output
     print("Guest module directory integration tests passed")
 
 

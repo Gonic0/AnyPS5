@@ -1,9 +1,11 @@
 #include "BdaShader.hpp"
 #include "BdaAbi.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <limits>
@@ -15,11 +17,19 @@
 
 namespace {
 
+std::string Hex(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
 using namespace AgcDriver::Graphics;
 
 class Pipeline {
 public:
-    Pipeline(const Context& context, std::span<const std::uint32_t> code, const std::array<Buffer*, 3>& buffers) : context(context) {
+    Pipeline(const Context& context, std::span<const std::uint32_t> code, const std::array<Buffer*, 3>& buffers) : Pipeline(context, code, std::array<VkDescriptorBufferInfo, 3>{whole(*buffers[0]), whole(*buffers[1]), whole(*buffers[2])}) {}
+
+    Pipeline(const Context& context, std::span<const std::uint32_t> code, const std::array<VkDescriptorBufferInfo, 3>& buffers) : context(context) {
         try {
             std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
             for (std::uint32_t i = 0; i < bindings.size(); ++i) bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -36,13 +46,12 @@ public:
             VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, pool, 1, &setLayout};
             Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), "vkAllocateDescriptorSets");
             for (std::uint32_t i = 0; i < buffers.size(); ++i) {
-                const VkDescriptorBufferInfo buffer{buffers[i]->Handle(), 0, buffers[i]->Bytes().size()};
                 VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 write.dstSet = set;
                 write.dstBinding = i;
                 write.descriptorCount = 1;
                 write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                write.pBufferInfo = &buffer;
+                write.pBufferInfo = &buffers[i];
                 context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &write, 0, nullptr);
             }
             VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -62,20 +71,26 @@ public:
 
     ~Pipeline() { release(); }
 
-    void Run(std::uint32_t groups) {
+    void Run(std::uint32_t groups) { RunTogether(context, {this}, groups); }
+
+    static void RunTogether(const Context& context, std::initializer_list<Pipeline*> pipelines, std::uint32_t groups = 1) {
         CommandBatch batch(context);
         const auto commands = batch.Handle();
         VkMemoryBarrier upload{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &upload, 0, nullptr, 0, nullptr);
-        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-        context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
-        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, groups, 1, 1);
+        for (const auto* pipeline : pipelines) {
+            context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+            context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout, 0, 1, &pipeline->set, 0, nullptr);
+            context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, groups, 1, 1);
+        }
         VkMemoryBarrier download{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &download, 0, nullptr, 0, nullptr);
         batch.SubmitAndWait();
     }
 
 private:
+    static VkDescriptorBufferInfo whole(Buffer& buffer) { return {buffer.Handle(), 0, buffer.Bytes().size()}; }
+
     void release() noexcept {
         if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
         if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
@@ -293,7 +308,7 @@ static void RunBdaAnchorTests(const Context& context) {
                     const auto expected = run(programs.plain, index, anchor, batch);
                     const auto actual = run(programs.anchored, index, anchor, batch);
                     const bool faultsMatch = programs.reads.lanes == 1u ? std::memcmp(&expected.fault, &actual.fault, sizeof(expected.fault)) == 0 : expected.fault.state == actual.fault.state;
-                    Require(faultsMatch && expected.values == actual.values, "an anchored BDA read differs from the same read through the lookups at anchor 0x" + std::to_string(anchor) + " + " + std::to_string(batch[0]) + " + (" + std::to_string(read.immediate) + "), " + std::to_string(read.bits) + " bits, " + std::to_string(read.dwords) + " dwords");
+                    Require(faultsMatch && expected.values == actual.values, "an anchored BDA read differs from the same read through the lookups at anchor " + Hex(anchor) + " + " + std::to_string(batch[0]) + " + (" + std::to_string(read.immediate) + "), " + std::to_string(read.bits) + " bits, " + std::to_string(read.dwords) + " dwords");
                 }
             }
         }
@@ -307,6 +322,9 @@ static void RunBdaAnchorTests(const Context& context) {
     for (std::uint32_t lane = 0; lane < 32u; ++lane) lows.push_back(lane * 0x24u);
     std::vector<std::uint32_t> strided;
     for (std::uint32_t lane = 0; lane < lanes; ++lane) strided.push_back(lane * 16u);
+    auto halfword = build({{{-1, 16, 1, 1}}, false, false, false, lanes});
+    compare(*halfword, {guest + 0x100}, {1u});
+    compare(*halfword, {guest + 0x100}, {0u, 1u});
     auto continuing = build({reads, false, false, false, lanes});
     compare(*continuing, anchors, lows);
     compare(*continuing, {guest + 0x400}, strided);
@@ -326,11 +344,11 @@ static void RunBdaAnchorTests(const Context& context) {
     };
     const auto loads = [&](std::uint32_t read, std::uint64_t anchor, std::uint32_t low, std::initializer_list<std::uint32_t> values) {
         const auto outcome = run(*direct, read, anchor, {low});
-        Require(outcome.fault.state == Abi::FaultState::Empty && std::equal(values.begin(), values.end(), outcome.values.begin()), "a read the anchor holds did not load directly at anchor 0x" + std::to_string(anchor) + " + " + std::to_string(low) + ", read " + std::to_string(read));
+        Require(outcome.fault.state == Abi::FaultState::Empty && std::equal(values.begin(), values.end(), outcome.values.begin()), "a read the anchor holds did not load directly at anchor " + Hex(anchor) + " + " + std::to_string(low) + ", read " + std::to_string(read));
     };
     const auto misses = [&](std::uint32_t read, std::uint64_t anchor, std::uint32_t low) {
         const auto outcome = run(*direct, read, anchor, {low});
-        Require(outcome.fault.state == Abi::FaultState::Empty && outcome.values[0] == BdaAnchoredReadSentinel, "a read the anchor does not hold did not take the lookup path at anchor 0x" + std::to_string(anchor) + " + " + std::to_string(low) + ", read " + std::to_string(read));
+        Require(outcome.fault.state == Abi::FaultState::Empty && outcome.values[0] == BdaAnchoredReadSentinel, "a read the anchor does not hold did not take the lookup path at anchor " + Hex(anchor) + " + " + std::to_string(low) + ", read " + std::to_string(read));
     };
     loads(2, guest + 0x100, 0, {dword(words, 0)});
     loads(2, guest + 0x100, 0xc, {dword(words, 0xc)});
@@ -376,6 +394,20 @@ static void RunBdaAnchorTests(const Context& context) {
     ranges = {{0, limit, large.DeviceAddress(), Abi::Read, 0}};
     count = 1;
     compare(*stopping, {limit - 1}, {0xffffffffu});
+    ranges = {{0x100000, 0x100010, top.DeviceAddress(), Abi::Read, 0}};
+    for (std::uint64_t index = 1; index < 8u; ++index) ranges.push_back({0x10000000 + index * 0x1000, 0x10000010 + index * 0x1000, above.DeviceAddress(), Abi::Read, 0});
+    count = static_cast<std::uint32_t>(ranges.size());
+    std::vector<std::uint32_t> mixed(lanes, 0x100u);
+    mixed[26] = 0x1u;
+    mixed[31] = 0x110u;
+    mixed[40] = 0x10cu;
+    const auto divergent = run(continuing->plain, 2, 0xfff00, mixed);
+    Require(divergent.fault.state == Abi::FaultState::Ready && divergent.fault.reason == Abi::FaultReason::Unmapped, "a subgroup reading below the first range, past a range's end and inside it did not record the unmapped read");
+    for (std::uint32_t lane = 0; lane < lanes; ++lane) {
+        const auto expected = lane == 26u || lane == 31u ? 0u : dword(top, lane == 40u ? 0xcu : 0u);
+        Require(divergent.values[lane * 4u] == expected, "a subgroup reading below the first range, past a range's end and inside it returned a wrong value in lane " + std::to_string(lane));
+    }
+    compare(*continuing, {0xfff00}, mixed);
 }
 
 void RunBdaExecutionTests(const Context& context) {
@@ -497,6 +529,20 @@ void RunBdaExecutionTests(const Context& context) {
     }
     ranges[0].permissions = 0;
     run(guest, 8, 0, Abi::FaultReason::Permission);
+    const auto sequence = [&](std::initializer_list<Abi::FaultReason> reasons, Abi::FaultReason recorded, std::uint32_t otherFaults) {
+        const Abi::Header header{Abi::Version, 2, sizeof(Abi::Range), 0};
+        std::memcpy(table.Bytes().data(), &header, sizeof(header));
+        std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), sizeof(ranges));
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        Pipeline pipeline(context, MakeBdaFaultSequenceTestShader(reasons), {&table, &fault, &output});
+        pipeline.Run(1);
+        Abi::Fault report{};
+        std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+        Require(report.state == Abi::FaultState::Ready && report.reason == recorded && report.otherFaults == otherFaults, "BDA faults of one dispatch were not recorded with the first reason and the sticky other-fault flag");
+    };
+    sequence({Abi::FaultReason::Unaligned, Abi::FaultReason::Unaligned}, Abi::FaultReason::Unaligned, 0);
+    sequence({Abi::FaultReason::Unaligned, Abi::FaultReason::Unmapped}, Abi::FaultReason::Unaligned, 1);
+    sequence({Abi::FaultReason::Unmapped, Abi::FaultReason::Unaligned}, Abi::FaultReason::Unmapped, 1);
     RunBdaDwordWriteTests(context);
     RunBdaAnchorTests(context);
 }
@@ -530,9 +576,9 @@ void RunBdaStoreExecutionTests(const Context& context) {
         Abi::Fault report{};
         std::memcpy(&report, fault.Bytes().data(), sizeof(report));
         if (reason == Abi::FaultReason{}) {
-            Require(report.state == Abi::FaultState::Empty && report.reason == Abi::FaultReason{} && report.address == 0 && report.bytes == 0 && report.stage == 0 && report.instruction == 0 && report.reserved == 0, label + "mapped store published a fault");
+            Require(report.state == Abi::FaultState::Empty && report.reason == Abi::FaultReason{} && report.address == 0 && report.bytes == 0 && report.stage == 0 && report.instruction == 0 && report.otherFaults == 0, label + "mapped store published a fault");
         } else {
-            Require(report.state == Abi::FaultState::Ready && report.reason == reason && report.address == faultAddress && report.bytes == faultBytes && report.stage == static_cast<std::uint32_t>(ShaderRecompiler::IrShaderStage::Compute) && report.instruction == 0x1234 && report.reserved == 0, label + "incorrect first fault metadata");
+            Require(report.state == Abi::FaultState::Ready && report.reason == reason && report.address == faultAddress && report.bytes == faultBytes && report.stage == static_cast<std::uint32_t>(ShaderRecompiler::IrShaderStage::Compute) && report.instruction == 0x1234 && report.otherFaults == 1, label + "incorrect first fault metadata");
         }
         std::array<std::uint32_t, Abi::FaultBufferBytes / sizeof(std::uint32_t)> words{};
         std::memcpy(words.data(), fault.Bytes().data(), sizeof(words));
@@ -571,4 +617,31 @@ void RunBdaStoreExecutionTests(const Context& context) {
         ranges = {{{guest + 3, guest + 5, first.DeviceAddress(), writable, 0}, {guest + 5, guest + 8, second.DeviceAddress(), writable, 0}}};
         run("split aligned dword", guest + 3, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Unmapped, guest + 3, 4);
     }
+}
+
+void RunBdaFaultSlotExecutionTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    Buffer table(context, sizeof(Abi::Header), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const Abi::Header header{Abi::Version, 0, sizeof(Abi::Range), 0};
+    std::memcpy(table.Bytes().data(), &header, sizeof(header));
+    Buffer output(context, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const VkDescriptorBufferInfo tableInfo{table.Handle(), 0, table.Bytes().size()};
+    const VkDescriptorBufferInfo outputInfo{output.Handle(), 0, output.Bytes().size()};
+    BdaResources first(context, true);
+    BdaResources second(context, true);
+    const auto firstSlot = first.Fault();
+    const auto secondSlot = second.Fault();
+    Require(firstSlot.buffer == secondSlot.buffer && firstSlot.range == sizeof(Abi::Fault) && secondSlot.range == sizeof(Abi::Fault) && firstSlot.offset != secondSlot.offset, "two report-only BdaResources did not take 32-byte slots of one fault chunk");
+    Pipeline firstPipeline(context, MakeBdaFaultSequenceTestShader({Abi::FaultReason::Unmapped}, 0x7fff11110000ULL), {tableInfo, firstSlot, outputInfo});
+    Pipeline secondPipeline(context, MakeBdaFaultSequenceTestShader({Abi::FaultReason::Unmapped}, 0x7fff22220000ULL), {tableInfo, secondSlot, outputInfo});
+    Pipeline::RunTogether(context, {&firstPipeline, &secondPipeline});
+    const auto reports = [](const BdaResources& resources, const char* address) {
+        try {
+            resources.CheckFault();
+        } catch (const std::runtime_error& error) {
+            return std::string(error.what()).find(address) != std::string::npos;
+        }
+        return false;
+    };
+    Require(reports(first, "address=0x7fff11110000") && reports(second, "address=0x7fff22220000"), "two dispatches of one batch faulting into neighbouring report-only fault slots did not each report their own address");
 }

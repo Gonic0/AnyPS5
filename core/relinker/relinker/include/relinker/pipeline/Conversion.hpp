@@ -15,14 +15,17 @@ struct ConversionOptions {
     std::uint32_t UnusedFilterLevel = 0;
     bool ToIntel = false;
     bool ToRosetta = false;
+    bool FrameRedZone = false;
     bool SkipSyscallCheck = false;
     bool TrapSdkSyscallStubs = false;
     bool LazyBinding = false;
+    bool OmitUnavailableDependencies = false;
     bool WindowsGui = false;
     bool TraceImports = false;
     std::optional<std::uint64_t> WindowsFixedBase;
     bool WindowsDiagnostics = false;
     std::optional<std::uint64_t> LinuxFixedBase;
+    std::optional<std::uint64_t> MacosFixedBase;
     std::string RunPath = "$ORIGIN/libs";
     std::set<std::string> ExcludedModules;
     std::vector<GamePatch::PatchEntry> Patches;
@@ -45,6 +48,7 @@ struct ConversionOutput {
     RelinkResult Analysis;
     std::string WindowsDiagnostics;
     std::vector<GamePatch::AppliedPatch> AppliedPatches;
+    std::optional<std::uint64_t> LinuxBase;
 };
 
 class Conversion {
